@@ -1,0 +1,7 @@
+-std=c++20
+-I.
+-Icmake/apm_probe_compat
+-DWEBRTC_APM_PROBE=1
+-DWEBRTC_WIN=1
+-DWIN32_LEAN_AND_MEAN
+-DNOMINMAX
