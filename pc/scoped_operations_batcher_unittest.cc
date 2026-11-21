@@ -15,12 +15,25 @@
 #include <vector>
 
 #include "absl/functional/any_invocable.h"
+#include "api/function_view.h"
+#include "api/location.h"
 #include "api/rtc_error.h"
+#include "rtc_base/null_socket_server.h"
 #include "rtc_base/thread.h"
 #include "test/gtest.h"
 
 namespace webrtc {
 namespace {
+
+class FakeQuittingThread : public Thread {
+ public:
+  FakeQuittingThread() : Thread(std::make_unique<NullSocketServer>()) {}
+
+  void BlockingCallImpl(FunctionView<void()> functor,
+                        const Location& location) override {
+    // Do nothing to simulate dropping the task when quitting.
+  }
+};
 
 TEST(ScopedOperationsBatcherTest, ExecutesTasksOnTargetThread) {
   auto target_thread = Thread::Create();
@@ -59,7 +72,7 @@ TEST(ScopedOperationsBatcherTest, ExecutesReturnedTasksOnCallingThread) {
   {
     ScopedOperationsBatcher batcher(target_thread.get());
     ScopedOperationsBatcher::BatchTaskWithFinalizer task =
-        [&]() -> RTCErrorOr<ScopedOperationsBatcher::FinalizerTask> {
+        [&]() -> ScopedOperationsBatcher::BatchTaskResult {
       task_executed = true;
       task_thread = Thread::Current();
       return ScopedOperationsBatcher::FinalizerTask([&]() {
@@ -116,25 +129,22 @@ TEST(ScopedOperationsBatcherTest, StopsExecutionOnError) {
   {
     ScopedOperationsBatcher batcher(target_thread.get());
     // Task 1.
-    batcher.AddWithFinalizer(
-        [&]() -> RTCErrorOr<ScopedOperationsBatcher::FinalizerTask> {
-          task1_executed = true;
-          return ScopedOperationsBatcher::FinalizerTask(
-              [&] { finalizer1_executed = true; });
-        });
+    batcher.AddWithFinalizer([&]() -> ScopedOperationsBatcher::BatchTaskResult {
+      task1_executed = true;
+      return ScopedOperationsBatcher::FinalizerTask(
+          [&] { finalizer1_executed = true; });
+    });
     // Task 2.
-    batcher.AddWithFinalizer(
-        [&]() -> RTCErrorOr<ScopedOperationsBatcher::FinalizerTask> {
-          task2_executed = true;
-          return RTCError(RTCErrorType::INVALID_STATE, "Failed");
-        });
+    batcher.AddWithFinalizer([&]() -> ScopedOperationsBatcher::BatchTaskResult {
+      task2_executed = true;
+      return RTCError(RTCErrorType::INVALID_STATE, "Failed");
+    });
     // Task 3.
-    batcher.AddWithFinalizer(
-        [&]() -> RTCErrorOr<ScopedOperationsBatcher::FinalizerTask> {
-          task3_executed = true;
-          return ScopedOperationsBatcher::FinalizerTask(
-              [&] { finalizer3_executed = true; });
-        });
+    batcher.AddWithFinalizer([&]() -> ScopedOperationsBatcher::BatchTaskResult {
+      task3_executed = true;
+      return ScopedOperationsBatcher::FinalizerTask(
+          [&] { finalizer3_executed = true; });
+    });
 
     error = batcher.Run();
   }
@@ -150,6 +160,32 @@ TEST(ScopedOperationsBatcherTest, StopsExecutionOnError) {
   EXPECT_FALSE(finalizer3_executed);
 }
 
+TEST(ScopedOperationsBatcherTest, RunsFinalizerReturnedWithError) {
+  auto target_thread = Thread::Create();
+  target_thread->Start();
+
+  bool finalizer_executed = false;
+  bool task2_executed = false;
+
+  RTCError error = RTCError::OK();
+  {
+    ScopedOperationsBatcher batcher(target_thread.get());
+    batcher.AddWithFinalizer([&]() -> ScopedOperationsBatcher::BatchTaskResult {
+      return {RTCError(RTCErrorType::INVALID_STATE, "Failed"),
+              [&] { finalizer_executed = true; }};
+    });
+    batcher.Add([&] { task2_executed = true; });
+
+    error = batcher.Run();
+  }
+
+  EXPECT_FALSE(error.ok());
+  EXPECT_EQ(error.type(), RTCErrorType::INVALID_STATE);
+  EXPECT_STREQ(error.message(), "Failed");
+  EXPECT_TRUE(finalizer_executed);
+  EXPECT_FALSE(task2_executed);
+}
+
 TEST(ScopedOperationsBatcherTest, IsEmptyReflectsTaskCount) {
   auto target_thread = Thread::Create();
   target_thread->Start();
@@ -162,6 +198,27 @@ TEST(ScopedOperationsBatcherTest, IsEmptyReflectsTaskCount) {
 
   EXPECT_TRUE(batcher.Run().ok());
   EXPECT_TRUE(batcher.IsEmpty());
+}
+
+TEST(ScopedOperationsBatcherTest, AbortsGracefullyWhenTargetThreadQuits) {
+  FakeQuittingThread target_thread;
+  target_thread.Start();
+
+  ScopedOperationsBatcher batcher(&target_thread);
+  batcher.Add([] {});
+
+  // This should return an error and not hang or crash.
+  RTCError error = batcher.Run();
+  EXPECT_FALSE(error.ok());
+  EXPECT_EQ(error.type(), RTCErrorType::INTERNAL_ERROR);
+
+  // Explicitly stop `target_thread` before it is destroyed to avoid a conflict
+  // between the FakeQuittingThread destructor and ~Thread().
+  // Otherwise, the background thread continues running `ProcessMessages()` and
+  // making virtual calls (like `IsQuitting()`) while the
+  // `~FakeQuittingThread()` destructor is run and resets the vptr (which
+  // triggers a race with TSAN).
+  target_thread.Stop();
 }
 
 }  // namespace

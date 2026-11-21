@@ -9,12 +9,14 @@
  */
 #include "modules/video_coding/codecs/av1/libaom_av1_encoder.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <map>
 #include <memory>
 #include <numeric>
 #include <optional>
+#include <span>
 #include <utility>
 #include <vector>
 
@@ -50,7 +52,6 @@
 #include "rtc_base/checks.h"
 #include "rtc_base/experiments/encoder_info_settings.h"
 #include "rtc_base/experiments/encoder_speed_experiment.h"
-#include "rtc_base/experiments/psnr_experiment.h"
 #include "rtc_base/logging.h"
 #include "system_wrappers/include/clock.h"
 #include "third_party/libaom/source/libaom/aom/aom_codec.h"
@@ -149,6 +150,10 @@ class LibaomAv1Encoder final : public VideoEncoder {
 
   void SetRates(const RateControlParameters& parameters) override;
 
+  void SetComplexity(
+      std::span<const VideoCodecComplexity> complexity_by_spatial_layer,
+      ComplexityControlMode complexity_control_mode) override;
+
   EncoderInfo GetEncoderInfo() const override;
 
  private:
@@ -220,8 +225,6 @@ class LibaomAv1Encoder final : public VideoEncoder {
   const LibaomAv1EncoderInfoSettings encoder_info_override_;
 
   // Determine whether the frame should be sampled for PSNR.
-  // TODO(webrtc:388070060): Remove after rollout.
-  const PsnrExperiment psnr_experiment_;
   FrameSampler psnr_frame_sampler_;
   const bool drop_repeat_frames_on_enhancement_layers_;
   std::map<int, uint32_t> last_encoded_timestamp_by_sid_;
@@ -230,6 +233,8 @@ class LibaomAv1Encoder final : public VideoEncoder {
   // One speed controller per spatial layer.
   std::vector<std::unique_ptr<webrtc::EncoderSpeedController>>
       speed_controllers_;
+  // Fixed speed per spatial layer, used when `speed_controllers_` is empty.
+  std::vector<int> fixed_speeds_;
   // Don't use when setting input frame timestamps!
   Clock* const realtime_clock_;
 };
@@ -273,12 +278,11 @@ LibaomAv1Encoder::LibaomAv1Encoder(const Environment& env,
       timestamp_(0),
       env_(env),
       encoder_info_override_(env_.field_trials()),
-      psnr_experiment_(env.field_trials()),
-      psnr_frame_sampler_(psnr_experiment_.SamplingInterval()),
+      psnr_frame_sampler_(FrameSampler::kDefaultPsnrFrameSamplingInterval),
       drop_repeat_frames_on_enhancement_layers_(env.field_trials().IsEnabled(
           "WebRTC-LibaomAv1Encoder-DropRepeatFramesOnEnhancementLayers")),
       encoder_speed_experiment_(env.field_trials()),
-      realtime_clock_(Clock::GetRealTimeClock()) {}
+      realtime_clock_(&env_.clock()) {}
 
 LibaomAv1Encoder::~LibaomAv1Encoder() {
   Release();
@@ -380,8 +384,10 @@ int LibaomAv1Encoder::InitEncode(const VideoCodec* codec_settings,
   inited_ = true;
 
   // Set control parameters
-  SET_ENCODER_PARAM_OR_RETURN_ERROR(AOME_SET_CPUUSED,
-                                    GetCpuSpeed(cfg_.g_w, cfg_.g_h));
+  const int initial_cpu_speed = GetCpuSpeed(cfg_.g_w, cfg_.g_h);
+  SET_ENCODER_PARAM_OR_RETURN_ERROR(AOME_SET_CPUUSED, initial_cpu_speed);
+  fixed_speeds_.assign(SvcEnabled() ? svc_params_->number_spatial_layers : 1,
+                       initial_cpu_speed);
   SET_ENCODER_PARAM_OR_RETURN_ERROR(AV1E_SET_ENABLE_CDEF, 1);
   SET_ENCODER_PARAM_OR_RETURN_ERROR(AV1E_SET_ENABLE_TPL_MODEL, 0);
   SET_ENCODER_PARAM_OR_RETURN_ERROR(AV1E_SET_DELTAQ_MODE, 0);
@@ -436,30 +442,9 @@ int LibaomAv1Encoder::InitEncode(const VideoCodec* codec_settings,
   SET_ENCODER_PARAM_OR_RETURN_ERROR(AV1E_SET_POSTENCODE_DROP_RTC, 1);
 
   if (encoder_speed_experiment_.IsDynamicSpeedEnabled()) {
-    LibaomSpeedConfigFactory speed_config_factory(
-        codec_settings->GetVideoEncoderComplexity(), codec_settings->mode);
-    RTC_DCHECK(speed_controllers_.empty());
-
-    if (SvcEnabled()) {
-      for (int si = 0; si < svc_params_->number_spatial_layers; ++si) {
-        EncoderSpeedController::Config speed_config =
-            speed_config_factory.GetSpeedConfig(
-                encoder_settings_.spatialLayers[si].width,
-                encoder_settings_.spatialLayers[si].height,
-                svc_controller_->StreamConfig().num_temporal_layers,
-                env_.field_trials());
-
-        speed_controllers_.push_back(
-            EncoderSpeedController::Create(speed_config, GetFrameInterval(si)));
-      }
-    } else {
-      EncoderSpeedController::Config speed_config =
-          speed_config_factory.GetSpeedConfig(
-              encoder_settings_.width, encoder_settings_.height,
-              /*num_temporal_layers=*/1, env_.field_trials());
-      speed_controllers_.push_back(EncoderSpeedController::Create(
-          speed_config, GetFrameInterval(/*spatial_index=*/0)));
-    }
+    const VideoCodecComplexity complexity =
+        codec_settings->GetVideoEncoderComplexity();
+    SetComplexity({&complexity, 1}, ComplexityControlMode::kVariable);
   }
 
   return WEBRTC_VIDEO_CODEC_OK;
@@ -667,6 +652,7 @@ int32_t LibaomAv1Encoder::Release() {
     inited_ = false;
   }
   speed_controllers_.clear();
+  fixed_speeds_.clear();
   rates_configured_ = false;
   return WEBRTC_VIDEO_CODEC_OK;
 }
@@ -802,8 +788,9 @@ int32_t LibaomAv1Encoder::Encode(
           it != last_encoded_timestamp_by_sid_.end()) {
         // Get the time since the last encoded frame for this spatial layer.
         // Don't drop enhancement layer repeat frame if last encode was more
-        // than one second ago.
-        if ((frame.rtp_timestamp() - it->second) > kVideoPayloadTypeFrequency) {
+        // than 500ms ago.
+        if ((frame.rtp_timestamp() - it->second) >
+            kVideoPayloadTypeFrequency / 2) {
           all_layers_droppable = false;
           break;
         }
@@ -1029,11 +1016,12 @@ int32_t LibaomAv1Encoder::Encode(
     } else {
       // No speed controller used.
 
-      if (kEnablePsnrStats && psnr_experiment_.IsEnabled() &&
-          psnr_frame_sampler_.ShouldBeSampled(frame)) {
+      if (kEnablePsnrStats && psnr_frame_sampler_.ShouldBeSampled(frame)) {
         flags |= AOM_EFLAG_CALCULATE_PSNR;
       }
 
+      RTC_DCHECK_GT(fixed_speeds_.size(), sid);
+      SET_ENCODER_PARAM_OR_RETURN_ERROR(AOME_SET_CPUUSED, fixed_speeds_[sid]);
       output = DoEncode(duration, flags, layer_frame);
       if (output.status_code != AOM_CODEC_OK) {
         RTC_LOG(LS_WARNING)
@@ -1249,6 +1237,71 @@ void LibaomAv1Encoder::SetRates(const RateControlParameters& parameters) {
   }
 
   rates_configured_ = true;
+}
+
+void LibaomAv1Encoder::SetComplexity(
+    std::span<const VideoCodecComplexity> complexity_by_spatial_layer,
+    ComplexityControlMode complexity_control_mode) {
+  if (!inited_) {
+    return;
+  }
+
+  const size_t num_spatial_layers =
+      SvcEnabled() ? svc_params_->number_spatial_layers : 1;
+  auto get_layer_complexity = [&](size_t si) {
+    if (complexity_by_spatial_layer.empty()) {
+      return VideoCodecComplexity::kComplexityNormal;
+    }
+    return complexity_by_spatial_layer[std::min(
+        si, complexity_by_spatial_layer.size() - 1)];
+  };
+
+  switch (complexity_control_mode) {
+    case ComplexityControlMode::kConstant:
+      speed_controllers_.clear();
+      for (size_t si = 0; si < num_spatial_layers; ++si) {
+        switch (get_layer_complexity(si)) {
+          case VideoCodecComplexity::kComplexityLow:
+            fixed_speeds_[si] = 11;
+            break;
+          case VideoCodecComplexity::kComplexityNormal:
+            fixed_speeds_[si] = 10;
+            break;
+          case VideoCodecComplexity::kComplexityHigh:
+            fixed_speeds_[si] = 9;
+            break;
+          case VideoCodecComplexity::kComplexityHigher:
+            fixed_speeds_[si] = 8;
+            break;
+          case VideoCodecComplexity::kComplexityMax:
+            fixed_speeds_[si] = 5;
+            break;
+        }
+      }
+      break;
+    case ComplexityControlMode::kVariable: {
+      const int num_temporal_layers =
+          SvcEnabled() ? svc_controller_->StreamConfig().num_temporal_layers
+                       : 1;
+      speed_controllers_.resize(num_spatial_layers);
+      for (size_t si = 0; si < num_spatial_layers; ++si) {
+        LibaomSpeedConfigFactory speed_config_factory(get_layer_complexity(si),
+                                                      encoder_settings_.mode);
+        const int width =
+            SvcEnabled() ? std::span(encoder_settings_.spatialLayers)[si].width
+                         : encoder_settings_.width;
+        const int height =
+            SvcEnabled() ? std::span(encoder_settings_.spatialLayers)[si].height
+                         : encoder_settings_.height;
+        EncoderSpeedController::Config speed_config =
+            speed_config_factory.GetSpeedConfig(width, height,
+                                                num_temporal_layers);
+        speed_controllers_[si] =
+            EncoderSpeedController::Create(speed_config, GetFrameInterval(si));
+      }
+      break;
+    }
+  }
 }
 
 VideoEncoder::EncoderInfo LibaomAv1Encoder::GetEncoderInfo() const {

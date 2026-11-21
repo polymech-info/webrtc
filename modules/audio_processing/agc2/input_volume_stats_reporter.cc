@@ -48,7 +48,6 @@ constexpr absl::string_view MetricNamePrefix(
     case InputVolumeType::kRecommended:
       return "WebRTC.Audio.Apm.RecommendedInputVolume.";
   }
-  return "";
 }
 
 metrics::Histogram* CreateVolumeHistogram(InputVolumeType input_volume_type) {

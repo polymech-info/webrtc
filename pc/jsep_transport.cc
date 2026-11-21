@@ -339,7 +339,7 @@ RTCError JsepTransport::VerifyCertificateFingerprint(
   desc << "Local fingerprint does not match identity. Expected: ";
   desc << fp_tmp->ToString();
   desc << " Got: " << fingerprint->ToString();
-  return RTCError(RTCErrorType::INVALID_PARAMETER, std::string(desc.str()));
+  return RTCError(RTCErrorType::INVALID_PARAMETER, desc.Release());
 }
 
 void JsepTransport::SetRemoteIceParameters(
@@ -399,7 +399,10 @@ bool JsepTransport::SetRtcpMux(bool enable,
 void JsepTransport::ActivateRtcpMux() {
   RTC_DCHECK_RUN_ON(&transport_sequence_);
   // If the transport is a DtlsSrtpTransport, it needs to know that RTCP mux
-  // is active to clear its RTCP transport.
+  // is active to clear its RTCP transport. This must happen before the RTCP
+  // transport is cleared, otherwise the active SRTP sessions would be reset
+  // and set up again with the same keys.
+  rtp_transport_->SetRtcpMuxEnabled(true);
   if (auto* dtls_srtp_transport = rtp_transport_->AsDtlsSrtpTransport()) {
     dtls_srtp_transport->SetDtlsTransports(rtp_dtls_transport(),
                                            /*rtcp_dtls_transport=*/nullptr);
@@ -453,6 +456,43 @@ RTCError JsepTransport::NegotiateAndSetDtlsParameters(
   // negotiation happens.
 
   RTC_DCHECK(rtp_dtls_transport());
+
+  // Must happen before SetNegotiatedDtlsParameters since that sets up DTLS
+  // which derives whether to handshake in STUN from the ICE config.
+  IceConfig config = rtp_dtls_transport()->ice_transport()->config();
+  // The ice-options are only consulted when DTLS-in-STUN is enabled locally so
+  // that munging one into the local description can not turn it on.
+  if (config.dtls_handshake_in_stun) {
+    // Both descriptions are consulted for `sped` since either one alone only
+    // reflects the local configuration for one of the two roles.
+    config.dtls_handshake_in_stun =
+        local_description_->transport_desc.HasOption(ICE_OPTION_GOOG_SPED_V1) ||
+        (local_description_->transport_desc.HasOption(ICE_OPTION_SPED) &&
+         remote_description_->transport_desc.HasOption(ICE_OPTION_SPED));
+    rtp_dtls_transport()->ice_transport()->SetIceConfig(config);
+
+    if (rtcp_dtls_transport()) {
+      IceConfig rtcp_config = rtcp_dtls_transport()->ice_transport()->config();
+      rtcp_config.dtls_handshake_in_stun = config.dtls_handshake_in_stun;
+      rtcp_dtls_transport()->ice_transport()->SetIceConfig(rtcp_config);
+    }
+  }
+
+  // Negotiating either option lets DTLS start before ICE is writable without
+  // waiting for a piggybacked packet, since an answer only echoes an option
+  // that the peer supports.
+  bool dtls_in_stun_negotiated =
+      (local_description_->transport_desc.HasOption(ICE_OPTION_SPED) &&
+       remote_description_->transport_desc.HasOption(ICE_OPTION_SPED)) ||
+      (local_description_->transport_desc.HasOption(ICE_OPTION_GOOG_SPED_V1) &&
+       remote_description_->transport_desc.HasOption(ICE_OPTION_GOOG_SPED_V1));
+  if (dtls_in_stun_negotiated) {
+    rtp_dtls_transport()->MaybeStartDtlsInStun();
+    if (rtcp_dtls_transport()) {
+      rtcp_dtls_transport()->MaybeStartDtlsInStun();
+    }
+  }
+
   RTCError error = SetNegotiatedDtlsParameters(
       rtp_dtls_transport(), negotiated_dtls_role, remote_fingerprint.get());
   if (!error.ok()) {
@@ -462,19 +502,6 @@ RTCError JsepTransport::NegotiateAndSetDtlsParameters(
   if (rtcp_dtls_transport()) {
     error = SetNegotiatedDtlsParameters(
         rtcp_dtls_transport(), negotiated_dtls_role, remote_fingerprint.get());
-  }
-
-  bool dtls_in_stun =
-      local_description_->transport_desc.HasOption(ICE_OPTION_GOOG_SPED_V1);
-
-  IceConfig config = rtp_dtls_transport()->ice_transport()->config();
-  config.dtls_handshake_in_stun = dtls_in_stun;
-  rtp_dtls_transport()->ice_transport()->SetIceConfig(config);
-
-  if (rtcp_dtls_transport()) {
-    IceConfig rtcp_config = rtcp_dtls_transport()->ice_transport()->config();
-    rtcp_config.dtls_handshake_in_stun = dtls_in_stun;
-    rtcp_dtls_transport()->ice_transport()->SetIceConfig(rtcp_config);
   }
 
   return error;

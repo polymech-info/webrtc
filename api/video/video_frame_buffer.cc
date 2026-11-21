@@ -30,9 +30,13 @@ scoped_refptr<VideoFrameBuffer> VideoFrameBuffer::CropAndScale(
     int crop_height,
     int scaled_width,
     int scaled_height) {
+  scoped_refptr<I420BufferInterface> i420_buffer = this->ToI420();
+  if (!i420_buffer) {
+    return nullptr;
+  }
   scoped_refptr<I420Buffer> result =
       I420Buffer::Create(scaled_width, scaled_height);
-  result->CropAndScaleFrom(*this->ToI420(), offset_x, offset_y, crop_width,
+  result->CropAndScaleFrom(*i420_buffer, offset_x, offset_y, crop_width,
                            crop_height);
   return result;
 }
@@ -86,6 +90,10 @@ const I410BufferInterface* VideoFrameBuffer::GetI410() const {
 const NV12BufferInterface* VideoFrameBuffer::GetNV12() const {
   RTC_CHECK(type() == Type::kNV12);
   return static_cast<const NV12BufferInterface*>(this);
+}
+
+scoped_refptr<I420BufferInterface> VideoFrameBuffer::ToI420ForInspection() {
+  return ToI420();
 }
 
 scoped_refptr<VideoFrameBuffer> VideoFrameBuffer::GetMappedFrameBuffer(

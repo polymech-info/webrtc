@@ -100,6 +100,9 @@ class DtlsTransportInternal : public PacketTransportInternal {
     return false;
   }
 
+  // Enable early DTLS start because DTLS-in-STUN was negotiated.
+  virtual void MaybeStartDtlsInStun() = 0;
+
   // Set DTLS remote fingerprint and role. Must be after local identity set.
   virtual RTCError SetRemoteParameters(absl::string_view digest_alg,
                                        const uint8_t* digest,
@@ -143,10 +146,7 @@ class DtlsTransportInternal : public PacketTransportInternal {
 
   // Emitted whenever the Dtls handshake failed on some transport channel.
   // F: void(SSLHandshakeError)
-  template <typename F>
-  [[deprecated]] void SubscribeDtlsHandshakeError(F&& callback) {
-    dtls_handshake_error_callback_list_.AddReceiver(std::forward<F>(callback));
-  }
+
   template <typename F>
   void SubscribeDtlsHandshakeError(void* tag, F&& callback) {
     dtls_handshake_error_callback_list_.AddReceiver(tag,

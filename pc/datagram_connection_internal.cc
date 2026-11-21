@@ -39,6 +39,7 @@
 #include "p2p/base/transport_description.h"
 #include "p2p/dtls/dtls_transport.h"
 #include "p2p/dtls/dtls_transport_internal.h"
+#include "pc/dtls_packet_processor.h"
 #include "pc/dtls_srtp_transport.h"
 #include "pc/dtls_transport.h"
 #include "pc/ice_transport.h"
@@ -101,7 +102,8 @@ DatagramConnectionInternal::DatagramConnectionInternal(
     std::unique_ptr<Observer> observer,
     WireProtocol wire_protocol,
     std::unique_ptr<IceTransportInternal> custom_ice_transport_internal)
-    : wire_protocol_(wire_protocol),
+    : env_(env),
+      wire_protocol_(wire_protocol),
       observer_(std::move(observer)),
       port_allocator_(std::move(port_allocator)),
       transport_channel_(
@@ -133,8 +135,9 @@ DatagramConnectionInternal::DatagramConnectionInternal(
           return;
         }
         this->OnDtlsPacket(
-            CopyOnWriteBuffer(packet.payload().data(), packet.payload().size()),
-            packet.arrival_time().value_or(Timestamp::MinusInfinity()));
+            CopyOnWriteBuffer(packet.payload()),
+            packet.arrival_time().value_or(Timestamp::MinusInfinity()),
+            packet.ecn());
       });
   if (wire_protocol_ == WireProtocol::kDtlsSrtp) {
     dtls_srtp_transport_->SetDtlsTransports(internal_transport_.get(),
@@ -145,7 +148,8 @@ DatagramConnectionInternal::DatagramConnectionInternal(
       this,
       std::bind_front(&DatagramConnectionInternal::OnCandidateGathered, this));
 
-  if (wire_protocol_ == WireProtocol::kDtls) {
+  if (wire_protocol_ == WireProtocol::kDtls ||
+      wire_protocol_ == WireProtocol::kDtlsWithFeedback) {
     internal_transport_->SubscribeWritableState(this, [this](bool is_writable) {
       this->OnWritableStatePossiblyChanged();
     });
@@ -188,9 +192,10 @@ DatagramConnectionInternal::DatagramConnectionInternal(
 
     dtls_srtp_transport_->SubscribeRtcpPacketReceived(
         this, [this](CopyOnWriteBuffer buffer,
-                     std::optional<Timestamp> packet_time_ms, EcnMarking) {
-          PacketMetadata metadata{.receive_time = packet_time_ms.value_or(
-                                      Timestamp::MinusInfinity())};
+                     std::optional<Timestamp> packet_time, EcnMarking ecn) {
+          PacketMetadata metadata{
+              .receive_time = packet_time.value_or(Timestamp::MinusInfinity()),
+              .ecn = ecn};
           observer_->OnPacketReceived(buffer, metadata);
         });
   } else {
@@ -198,6 +203,10 @@ DatagramConnectionInternal::DatagramConnectionInternal(
         this, [this](PacketTransportInternal*, const SentPacketInfo& packet) {
           OnSentPacket(packet);
         });
+  }
+
+  if (wire_protocol_ == WireProtocol::kDtlsWithFeedback) {
+    packet_processor_ = std::make_unique<DtlsPacketProcessor>();
   }
 
   RTC_CHECK(internal_transport_->SetLocalCertificate(certificate));
@@ -231,7 +240,8 @@ bool DatagramConnectionInternal::Writable() {
   if (current_state_ != State::kActive) {
     return false;
   }
-  if (wire_protocol_ == WireProtocol::kDtls) {
+  if (wire_protocol_ == WireProtocol::kDtls ||
+      wire_protocol_ == WireProtocol::kDtlsWithFeedback) {
     return internal_transport_->writable();
   }
   return internal_transport_->ice_transport()->writable() &&
@@ -286,6 +296,20 @@ void DatagramConnectionInternal::SendSinglePacket(
     return;
   }
 
+  if (wire_protocol_ == WireProtocol::kDtlsWithFeedback) {
+    // Frame the payload with a transport header (and possibly piggybacked
+    // feedback) before sending it inside a DTLS packet. The provider records
+    // the packet internally for later correlation with incoming feedback.
+    CopyOnWriteBuffer framed = packet_processor_->ProcessOutgoingPacket(
+        packet.payload, env_.clock().CurrentTime());
+    if (internal_transport_->SendPacket(
+            reinterpret_cast<const char*>(framed.cdata()), framed.size(),
+            options) < 0) {
+      DispatchSendOutcome(packet.id, Observer::SendOutcome::Status::kNotSent);
+    }
+    return;
+  }
+
   if (!dtls_srtp_transport_->IsSrtpActive()) {
     RTC_LOG(LS_ERROR) << "Dropping packet on non-active SRTP connection";
     DispatchSendOutcome(packet.id, Observer::SendOutcome::Status::kNotSent);
@@ -296,8 +320,7 @@ void DatagramConnectionInternal::SendSinglePacket(
       IsRtpOrRtcpPacket(packet.payload[0])) {
     // Copy the payload into a buffer with some extra capacity to allow space
     // for the SRTP encryption tag to be added.
-    CopyOnWriteBuffer buffer(packet.payload.data(), packet.payload.size(),
-                             kMaxRtpPacketLen);
+    CopyOnWriteBuffer buffer(packet.payload, kMaxRtpPacketLen);
 
     // Provide the flag PF_SRTP_BYPASS as these packets are being encrypted by
     // SRTP, so should bypass DTLS encryption.
@@ -376,16 +399,32 @@ void DatagramConnectionInternal::OnRtpPacket(const RtpPacketReceived& packet) {
   if (current_state_ != State::kActive) {
     return;
   }
-  PacketMetadata metadata{.receive_time = packet.arrival_time()};
+  PacketMetadata metadata{.receive_time = packet.arrival_time(),
+                          .ecn = packet.ecn()};
   observer_->OnPacketReceived(packet.Buffer(), metadata);
 }
 
 void DatagramConnectionInternal::OnDtlsPacket(CopyOnWriteBuffer packet,
-                                              Timestamp receive_time) {
+                                              Timestamp receive_time,
+                                              EcnMarking ecn) {
   if (current_state_ != State::kActive) {
     return;
   }
-  PacketMetadata metadata{.receive_time = receive_time};
+  PacketMetadata metadata{.receive_time = receive_time, .ecn = ecn};
+  if (wire_protocol_ == WireProtocol::kDtlsWithFeedback) {
+    // Strip the transport framing and route any parsed feedback to the feedback
+    // provider; deliver only the application payload (if any) to the app,
+    // through the same path as every other wire protocol.
+    std::optional<CopyOnWriteBuffer> payload =
+        packet_processor_->ProcessIncomingPacket(std::move(packet),
+                                                 receive_time, ecn);
+    if (payload) {
+      observer_->OnPacketReceived(
+          std::span<const uint8_t>(payload->cdata(), payload->size()),
+          metadata);
+    }
+    return;
+  }
   observer_->OnPacketReceived(packet, metadata);
 }
 

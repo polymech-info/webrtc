@@ -19,6 +19,7 @@
 
 #include "absl/strings/string_view.h"
 #include "api/create_modular_peer_connection_factory.h"
+#include "api/dtls_transport_interface.h"
 #include "api/enable_media_with_defaults.h"
 #include "api/jsep.h"
 #include "api/media_stream_interface.h"
@@ -44,14 +45,11 @@
 #include "pc/test/mock_peer_connection_observers.h"
 #include "rtc_base/thread.h"
 #include "test/create_test_environment.h"
+#include "test/create_test_field_trials.h"
 #include "test/gmock.h"
 #include "test/gtest.h"
 #include "test/pc/sctp/fake_sctp_transport.h"
 #include "test/run_loop.h"
-
-#ifdef WEBRTC_ANDROID
-#include "pc/test/android_test_initializer.h"
-#endif
 
 // This file contains tests that ensure the PeerConnection's implementation of
 // CreateOffer/CreateAnswer/SetLocalDescription/SetRemoteDescription conform
@@ -77,17 +75,10 @@ class PeerConnectionJsepTest : public ::testing::Test {
     network_thread_ = Thread::CreateWithSocketServer();
     network_thread_->SetName("NetworkThread", nullptr);
     EXPECT_TRUE(network_thread_->Start());
-    worker_thread_ = Thread::Create();
-    worker_thread_->SetName("WorkerThread", nullptr);
-    EXPECT_TRUE(worker_thread_->Start());
-#ifdef WEBRTC_ANDROID
-    InitializeAndroidObjects();
-#endif
   }
 
   PeerConnectionFactoryDependencies CreatePeerConnectionFactoryDependencies() {
     PeerConnectionFactoryDependencies dependencies;
-    dependencies.worker_thread = worker_thread_.get();
     dependencies.network_thread = network_thread_.get();
     dependencies.signaling_thread = Thread::Current();
     dependencies.adm = FakeAudioCaptureModule::Create();
@@ -103,13 +94,28 @@ class PeerConnectionJsepTest : public ::testing::Test {
     return CreatePeerConnection(config);
   }
 
+  WrapperPtr CreatePeerConnection(absl::string_view field_trials) {
+    RTCConfiguration config;
+    config.sdp_semantics = SdpSemantics::kUnifiedPlan;
+    return CreatePeerConnection(config, field_trials);
+  }
+
   WrapperPtr CreatePeerConnection(const RTCConfiguration& config) {
+    return CreatePeerConnection(config, "");
+  }
+
+  WrapperPtr CreatePeerConnection(const RTCConfiguration& config,
+                                  absl::string_view field_trials) {
     scoped_refptr<PeerConnectionFactoryInterface> pc_factory =
         CreateModularPeerConnectionFactory(
             CreatePeerConnectionFactoryDependencies());
     auto observer = std::make_unique<MockPeerConnectionObserver>();
-    auto result = pc_factory->CreatePeerConnectionOrError(
-        config, PeerConnectionDependencies(observer.get()));
+    PeerConnectionDependencies pc_deps(observer.get());
+    if (!field_trials.empty()) {
+      pc_deps.trials = CreateTestFieldTrialsPtr(field_trials);
+    }
+    auto result =
+        pc_factory->CreatePeerConnectionOrError(config, std::move(pc_deps));
     if (!result.ok()) {
       return nullptr;
     }
@@ -121,7 +127,6 @@ class PeerConnectionJsepTest : public ::testing::Test {
 
   test::RunLoop run_loop_;
   std::unique_ptr<Thread> network_thread_;
-  std::unique_ptr<Thread> worker_thread_;
 };
 
 // Tests for JSEP initial offer generation.
@@ -1207,7 +1212,9 @@ TEST_F(PeerConnectionJsepTest, OfferAnswerWithChangedMids) {
   constexpr char kFirstMid[] = "nondefaultmid";
   constexpr char kSecondMid[] = "randommid";
 
-  auto caller = CreatePeerConnection();
+  // Munging allowed: kMid (25)
+  auto caller =
+      CreatePeerConnection("WebRTC-NoSdpMangleAllowForTesting/Enabled,25/");
   caller->AddAudioTrack("a");
   caller->AddAudioTrack("b");
   auto callee = CreatePeerConnection();
@@ -1249,7 +1256,9 @@ TEST_F(PeerConnectionJsepTest, CreateOfferGeneratesUniqueMidIfAlreadyTaken) {
 
   // Now, do an offer/answer with one track which has the MID set to the default
   // second MID.
-  auto caller = CreatePeerConnection();
+  // Munging allowed: kMid (25)
+  auto caller =
+      CreatePeerConnection("WebRTC-NoSdpMangleAllowForTesting/Enabled,25/");
   caller->AddAudioTrack("a");
   auto callee = CreatePeerConnection();
 
@@ -2160,6 +2169,42 @@ TEST_F(PeerConnectionJsepTest, RollbackHasToDestroyTransport) {
             nullptr);
   EXPECT_NE(pc->pc()->GetTransceivers()[0]->sender()->dtls_transport(),
             audio_transport);
+}
+
+// Rolling back an offer that added an unbundled m= section destroys the
+// transport that was created for that m= section, while its channel was
+// attached to it. The transports of the other m= sections are not affected.
+TEST_F(PeerConnectionJsepTest, RollbackDestroysTransportOfNewUnbundledSection) {
+  PeerConnectionInterface::RTCOfferAnswerOptions no_bundle;
+  no_bundle.use_rtp_mux = false;
+  auto caller = CreatePeerConnection();
+  auto callee = CreatePeerConnection();
+  caller->AddAudioTrack("a");
+  ASSERT_TRUE(callee->SetRemoteDescription(
+      caller->CreateOfferAndSetAsLocal(no_bundle)));
+  ASSERT_TRUE(
+      caller->SetRemoteDescription(callee->CreateAnswerAndSetAsLocal()));
+  auto audio_transport =
+      caller->pc()->GetTransceivers()[0]->sender()->dtls_transport();
+  ASSERT_THAT(audio_transport, NotNull());
+
+  caller->AddVideoTrack("v");
+  ASSERT_TRUE(caller->SetLocalDescription(caller->CreateOffer(no_bundle)));
+  auto video_transport =
+      caller->pc()->GetTransceivers()[1]->sender()->dtls_transport();
+  ASSERT_THAT(video_transport, NotNull());
+  EXPECT_NE(video_transport, audio_transport);
+
+  EXPECT_TRUE(caller->SetLocalDescription(caller->CreateRollback()));
+  ASSERT_EQ(caller->pc()->GetTransceivers().size(), 2u);
+  EXPECT_EQ(caller->pc()->GetTransceivers()[0]->sender()->dtls_transport(),
+            audio_transport);
+  EXPECT_NE(audio_transport->Information().state(),
+            DtlsTransportState::kClosed);
+  EXPECT_EQ(caller->pc()->GetTransceivers()[1]->sender()->dtls_transport(),
+            nullptr);
+  EXPECT_EQ(video_transport->Information().state(),
+            DtlsTransportState::kClosed);
 }
 
 TEST_F(PeerConnectionJsepTest, RollbackLocalDirectionChange) {

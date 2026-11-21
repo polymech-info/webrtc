@@ -22,7 +22,6 @@
 #include "api/local_network_access_permission.h"
 #include "api/test/mock_async_dns_resolver.h"
 #include "api/test/mock_local_network_access_permission.h"
-#include "api/test/rtc_error_matchers.h"
 #include "api/units/timestamp.h"
 #include "p2p/base/port.h"
 #include "p2p/base/port_allocator.h"
@@ -50,11 +49,9 @@ namespace {
 
 using LnaFakeResult = FakeLocalNetworkAccessPermissionFactory::Result;
 using ::testing::_;
-using ::testing::DoAll;
 using ::testing::IsTrue;
 using ::testing::Return;
 using ::testing::ReturnPointee;
-using ::testing::SetArgPointee;
 
 const SocketAddress kTurnUdpIntAddr("99.99.99.3", webrtc::TURN_SERVER_PORT);
 const SocketAddress kTurnUdpExtAddr("99.99.99.5", 0);
@@ -129,16 +126,14 @@ class LocalNetworkAccessPortTest
         .lna_permission_factory = &lna_permission_factory,
     };
 
-    auto turn_port = TurnPort::Create(args, /*min_port=*/0, /*max_port=*/0);
     // The tests wait for either of the callbacks to be fired by checking if
     // port_ready_ or port_error_ becomes true. If neither happens, the test
     // will fail after a timeout.
-    turn_port->SubscribePortComplete(
-        this, [this](Port* port) { OnPortComplete(port); });
-    turn_port->SubscribePortError(this,
-                                  [this](Port* port) { OnPortError(port); });
+    args.callbacks.tag = this;
+    args.callbacks.port_complete = [this](Port* port) { OnPortComplete(port); };
+    args.callbacks.port_error = [this](Port* port) { OnPortError(port); };
 
-    return turn_port;
+    return TurnPort::Create(std::move(args), /*min_port=*/0, /*max_port=*/0);
   }
 
   std::unique_ptr<StunPort> CreateStunPort(
@@ -154,20 +149,21 @@ class LocalNetworkAccessPortTest
         .lna_permission_factory = &lna_permission_factory,
     };
 
-    auto stun_port = StunPort::Create(
-        params, 0, 0, {SocketAddress(server_address, 5000)}, std::nullopt);
-    stun_port->SubscribePortComplete(
-        this, [this](Port* port) { OnPortComplete(port); });
-    stun_port->SubscribePortError(this,
-                                  [this](Port* port) { OnPortError(port); });
+    params.callbacks.tag = this;
+    params.callbacks.port_complete = [this](Port* port) {
+      OnPortComplete(port);
+    };
+    params.callbacks.port_error = [this](Port* port) { OnPortError(port); };
 
-    return stun_port;
+    return StunPort::Create(std::move(params), 0, 0,
+                            {SocketAddress(server_address, 5000)},
+                            std::nullopt);
   }
 
   void setup_dns_resolver_mock() {
     auto expectations =
-        [&](webrtc::MockAsyncDnsResolver* resolver,
-            webrtc::MockAsyncDnsResolverResult* resolver_result) {
+        [](webrtc::MockAsyncDnsResolver* resolver,
+           webrtc::MockAsyncDnsResolverResult* resolver_result) {
           EXPECT_CALL(*resolver, Start(_, _, _))
               .WillOnce(
                   [](const webrtc::SocketAddress& /* addr */, int /* family */,
@@ -177,9 +173,10 @@ class LocalNetworkAccessPortTest
               .WillRepeatedly(ReturnPointee(resolver_result));
           EXPECT_CALL(*resolver_result, GetError).WillRepeatedly(Return(0));
           EXPECT_CALL(*resolver_result, GetResolvedAddress(_, _))
-              .WillOnce(
-                  DoAll(SetArgPointee<1>(SocketAddress(server_address(), 5000)),
-                        Return(true)));
+              .WillOnce([](int /*family*/, SocketAddress* addr) {
+                *addr = SocketAddress(server_address(), 5000);
+                return true;
+              });
         };
 
     socket_factory_.SetExpectations(std::move(expectations));
@@ -265,15 +262,13 @@ TEST_P(LocalNetworkAccessPortTest, ResolvedAddress) {
 
   if (lna_fake_result() == LnaFakeResult::kPermissionNotNeeded ||
       lna_fake_result() == LnaFakeResult::kPermissionGranted) {
-    EXPECT_THAT(WaitUntil([&] { return port_ready_; }, IsTrue(),
-                          {.clock = &time_controller_}),
-                IsRtcOk());
+    EXPECT_TRUE(
+        WaitUntil([&] { return port_ready_; }, {.clock = &time_controller_}));
     EXPECT_EQ(1u, port->Candidates().size());
     EXPECT_NE(SOCKET_ERROR, port->GetError());
   } else {
-    EXPECT_THAT(WaitUntil([&] { return port_error_; }, IsTrue(),
-                          {.clock = &time_controller_}),
-                IsRtcOk());
+    EXPECT_TRUE(
+        WaitUntil([&] { return port_error_; }, {.clock = &time_controller_}));
     EXPECT_EQ(0u, port->Candidates().size());
     EXPECT_NE(SOCKET_ERROR, port->GetError());
   }
@@ -288,15 +283,13 @@ TEST_P(LocalNetworkAccessPortTest, UnresolvedAddress) {
 
   if (lna_fake_result() == LnaFakeResult::kPermissionNotNeeded ||
       lna_fake_result() == LnaFakeResult::kPermissionGranted) {
-    EXPECT_THAT(WaitUntil([&] { return port_ready_; }, IsTrue(),
-                          {.clock = &time_controller_}),
-                IsRtcOk());
+    EXPECT_TRUE(
+        WaitUntil([&] { return port_ready_; }, {.clock = &time_controller_}));
     EXPECT_EQ(1u, port->Candidates().size());
     EXPECT_NE(SOCKET_ERROR, port->GetError());
   } else {
-    EXPECT_THAT(WaitUntil([&] { return port_error_; }, IsTrue(),
-                          {.clock = &time_controller_}),
-                IsRtcOk());
+    EXPECT_TRUE(
+        WaitUntil([&] { return port_error_; }, {.clock = &time_controller_}));
     EXPECT_EQ(0u, port->Candidates().size());
     EXPECT_NE(SOCKET_ERROR, port->GetError());
   }

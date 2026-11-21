@@ -34,12 +34,12 @@
 #include "api/rtp_header_extension_id.h"
 #include "api/rtp_headers.h"
 #include "api/scoped_refptr.h"
-#include "api/transport/rtp/rtp_source.h"
 #include "api/units/data_rate.h"
 #include "api/units/time_delta.h"
 #include "api/units/timestamp.h"
 #include "audio/channel_receive.h"
 #include "audio/channel_send.h"
+#include "call/sframe_options.h"
 #include "call/syncable.h"
 #include "modules/audio_coding/include/audio_coding_module_typedefs.h"
 #include "modules/rtp_rtcp/include/report_block_data.h"
@@ -84,7 +84,6 @@ class MockChannelReceive : public voe::ChannelReceiveInterface {
               (int sample_rate_hz, AudioFrame*),
               (override));
   MOCK_METHOD(int, PreferredSampleRate, (), (const, override));
-  MOCK_METHOD(std::vector<RtpSource>, GetSources, (), (const, override));
   MOCK_METHOD(std::optional<Syncable::PlayoutInfo>,
               GetPlayoutRtpTimestamp,
               (),
@@ -194,6 +193,10 @@ class MockChannelSend : public voe::ChannelSendInterface {
   MOCK_METHOD(void,
               SetFrameEncryptor,
               (webrtc::scoped_refptr<FrameEncryptorInterface> frame_encryptor),
+              (override));
+  MOCK_METHOD(void,
+              SetSframeOptions,
+              (const SframeSendOptions& options),
               (override));
   MOCK_METHOD(void,
               SetEncoderToPacketizerFrameTransformer,

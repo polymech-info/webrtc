@@ -96,7 +96,7 @@ def webrtc_builder(
         properties = None,
         recipe = "standalone",
         priority = 30,
-        execution_timeout = 2 * time.hour,
+        execution_timeout = 3 * time.hour,
         **kwargs):
     """WebRTC specific wrapper around luci.builder.
 
@@ -165,13 +165,15 @@ def ci_builder(
         kwargs["priority"] = 29
 
     add_milo(name, {"ci": ci_cat, "perf": perf_cat})
-    if ci_cat and not perf_cat:
-        lkgr_builders.append(name)
     dimensions = ({"os": os_from_name(name), "pool": "luci.webrtc.ci", "cpu": kwargs.pop("cpu", DEFAULT_CPU)})
     dimensions["builderless"] = "1"
     properties = properties or {}
     properties["builder_group"] = "client.webrtc"
     properties.update(make_siso_properties("rbe-webrtc-trusted"))
+
+    if ci_cat and not perf_cat:
+        properties["gardener_rotations"] = ["webrtc"]
+        lkgr_builders.append(name)
 
     notifies = ["post_submit_failure_notifier", "infra_failure_notifier"]
     notifies += ["webrtc_tree_closer"] if name not in skipped_lkgr_bots else []
@@ -194,6 +196,7 @@ def try_builder(
         cq = {},
         branch_cq = True,
         builder = None,
+        jobs = None,
         **kwargs):
     """Add a pre-submit builder.
 
@@ -204,6 +207,7 @@ def try_builder(
       cq: None to exclude this from all commit queues, or a dict of kwargs for cq_tryjob_verifier.
       branch_cq: False to exclude this builder just from the release-branch CQ.
       builder: builder to set in the dimensions, if None, builderless:1 is used.
+      jobs: int, number of remote jobs to allow in parallel.
       **kwargs: Pass on to webrtc_builder / luci.builder.
     Returns:
       A luci.builder.
@@ -216,7 +220,7 @@ def try_builder(
         dimensions["builderless"] = "1"
     properties = properties or {}
     properties["builder_group"] = "tryserver.webrtc"
-    properties.update(make_siso_properties("rbe-webrtc-untrusted"))
+    properties.update(make_siso_properties("rbe-webrtc-untrusted", jobs))
     if cq != None:
         luci.cq_tryjob_verifier(name, cq_group = "cq", **cq)
         if branch_cq:
@@ -285,6 +289,7 @@ def chromium_try_builder(name, **kwargs):
         recipe = "chromium_trybot",
         branch_cq = False,
         execution_timeout = 3 * time.hour,
+        jobs = 500,
         **kwargs
     )
 
@@ -309,7 +314,7 @@ ios_builder, ios_try_job = normal_builder_factory(
 # Actual builder configuration:
 
 ci_builder("Android64 (dbg)", "Android|arm64|dbg")
-try_builder("android_compile_arm_dbg")
+try_builder("android_compile_arm_dbg", cq = None)
 try_builder("android_arm_dbg")
 ci_builder("Android64", "Android|arm64|rel")
 try_builder("android_arm_rel")
@@ -330,7 +335,7 @@ try_builder("android_arm_more_configs")
 chromium_try_builder("android_chromium_compile")
 
 ios_builder("iOS64 Debug", "iOS|arm64|dbg")
-ios_try_job("ios_compile_arm64_dbg")
+ios_try_job("ios_compile_arm64_dbg", cq = None)
 ios_builder("iOS64 Release", "iOS|arm64|rel")
 ios_try_job("ios_compile_arm64_rel")
 ios_builder("iOS Debug (simulator)", "iOS|x64|sim")
@@ -397,7 +402,7 @@ ci_builder("MacARM64 M1 Release", "Mac|arm64M1|rel", cpu = "arm64-64-Apple_M1")
 try_builder("mac_rel_m1")
 try_builder("mac_dbg_m1")
 
-# TODO: b/427073823 - Re-enable once the slow compilation issue is fixed.
+# TODO(b/427073823): Re-enable once the slow compilation issue is fixed.
 chromium_try_builder("mac_chromium_compile", cq = None)
 
 ci_builder("Win32 Debug (Clang)", "Win Clang|x86|dbg")
@@ -410,18 +415,20 @@ ci_builder("Win64 Builder (Clang)", ci_cat = None, perf_cat = "Win|x64|Builder|"
 perf_builder("Perf Win 10", "Win|x64|Tester|10", triggered_by = ["Win64 Builder (Clang)"])
 ci_builder("Win64 Debug (Clang)", "Win Clang|x64|dbg")
 try_builder("win_x64_clang_dbg")
-try_builder("win_compile_x64_clang_dbg")
+try_builder("win_compile_x64_clang_dbg", cq = None)
 ci_builder("Win64 Release (Clang)", "Win Clang|x64|rel")
 try_builder("win_x64_clang_rel")
-try_builder("win_compile_x64_clang_rel")
+try_builder("win_compile_x64_clang_rel", cq = None)
 ci_builder("Win64 ASan", "Win Clang|x64|asan")
 try_builder("win_asan")
 ci_builder("Win (more configs)", "Win Clang|x86|more")
 try_builder("win_x86_more_configs")
 try_builder("win11_release", cq = None)
 try_builder("win11_debug", cq = None)
-chromium_try_builder("win_chromium_compile")
-chromium_try_builder("win_chromium_compile_dbg")
+
+# TODO(b/562984134): Re-enable once the infra issue is resolved
+chromium_try_builder("win_chromium_compile", cq = None)
+chromium_try_builder("win_chromium_compile_dbg", cq = None)
 
 try_builder("iwyu_verifier")
 
@@ -473,12 +480,13 @@ lkgr_config = {
                 "WebRTC Chromium FYI Mac Builder (dbg)",
                 "WebRTC Chromium FYI Mac Builder",
                 "WebRTC Chromium FYI Mac Tester",
-                "WebRTC Chromium FYI Win Builder (dbg)",
-                "WebRTC Chromium FYI Win Builder",
-                "WebRTC Chromium FYI Win Tester",
-                # TODO: b/441273941 - Re-enable once the ios infra issue is resolved
-                #"WebRTC Chromium FYI ios-device",
-                #"WebRTC Chromium FYI ios-simulator",
+                # TODO(b/562984134): Re-enable once the infra issue is resolved
+                # "WebRTC Chromium FYI Win Builder (dbg)",
+                # "WebRTC Chromium FYI Win Builder",
+                # "WebRTC Chromium FYI Win Tester",
+                # TODO(b/441273941): Re-enable once the ios infra issue is resolved
+                # "WebRTC Chromium FYI ios-device",
+                # "WebRTC Chromium FYI ios-simulator",
             ],
         },
     },

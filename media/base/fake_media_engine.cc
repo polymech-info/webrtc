@@ -22,6 +22,7 @@
 
 #include "absl/functional/any_invocable.h"
 #include "absl/strings/match.h"
+#include "absl/strings/string_view.h"
 #include "api/audio/audio_device.h"
 #include "api/audio_options.h"
 #include "api/call/audio_sink.h"
@@ -29,10 +30,11 @@
 #include "api/environment/environment.h"
 #include "api/field_trials_view.h"
 #include "api/make_ref_counted.h"
+#include "api/rtp_packet_infos.h"
 #include "api/rtp_parameters.h"
 #include "api/scoped_refptr.h"
 #include "api/task_queue/task_queue_base.h"
-#include "api/transport/rtp/rtp_source.h"
+#include "api/units/timestamp.h"
 #include "api/video/recordable_encoded_frame.h"
 #include "api/video/video_bitrate_allocator_factory.h"
 #include "api/video/video_sink_interface.h"
@@ -107,7 +109,6 @@ int FakeVoiceMediaReceiveChannel::max_bps() const {
 }
 bool FakeVoiceMediaReceiveChannel::SetReceiverParameters(
     const AudioReceiverParameters& params) {
-  set_recv_rtcp_parameters(params.rtcp);
   return (SetRecvCodecs(params.codecs) &&
           SetRecvRtpHeaderExtensions(params.extensions));
 }
@@ -195,10 +196,6 @@ void FakeVoiceMediaReceiveChannel::SetDefaultRawAudioSink(
     std::unique_ptr<AudioSinkInterface> sink) {
   sink_ = std::move(sink);
 }
-std::vector<RtpSource> FakeVoiceMediaReceiveChannel::GetSources(
-    uint32_t /* ssrc */) const {
-  return std::vector<RtpSource>();
-}
 bool FakeVoiceMediaReceiveChannel::SetRecvCodecs(
     const std::vector<Codec>& codecs) {
   if (fail_set_recv_codecs()) {
@@ -275,14 +272,19 @@ const AudioOptions& FakeVoiceMediaSendChannel::options() const {
 int FakeVoiceMediaSendChannel::max_bps() const {
   return max_bps_;
 }
+const std::string& FakeVoiceMediaSendChannel::mid() const {
+  return mid_;
+}
 bool FakeVoiceMediaSendChannel::SetSenderParameters(
     const AudioSenderParameter& params) {
-  set_send_rtcp_parameters(params.rtcp);
   SetExtmapAllowMixed(params.extmap_allow_mixed);
   return (SetSendCodecs(params.codecs) &&
           SetSendRtpHeaderExtensions(params.extensions) &&
           SetMaxSendBandwidth(params.max_bandwidth_bps) &&
           SetOptions(params.options));
+}
+void FakeVoiceMediaSendChannel::SetMid(absl::string_view mid) {
+  mid_ = std::string(mid);
 }
 bool FakeVoiceMediaSendChannel::SetSend(bool send) {
   return set_sending(send);
@@ -404,7 +406,6 @@ int FakeVideoMediaSendChannel::max_bps() const {
 }
 bool FakeVideoMediaSendChannel::SetSenderParameters(
     const VideoSenderParameters& params) {
-  set_send_rtcp_parameters(params.rtcp);
   SetExtmapAllowMixed(params.extmap_allow_mixed);
   return (SetSendCodecs(params.codecs) &&
           SetSendRtpHeaderExtensions(params.extensions) &&
@@ -494,7 +495,6 @@ int FakeVideoMediaReceiveChannel::max_bps() const {
 }
 bool FakeVideoMediaReceiveChannel::SetReceiverParameters(
     const VideoReceiverParameters& params) {
-  set_recv_rtcp_parameters(params.rtcp);
   return (SetRecvCodecs(params.codecs) &&
           SetRecvRtpHeaderExtensions(params.extensions));
 }
@@ -531,10 +531,6 @@ bool FakeVideoMediaReceiveChannel::RemoveRecvStream(uint32_t ssrc) {
   sinks_.erase(ssrc);
   output_delays_.erase(ssrc);
   return true;
-}
-std::vector<RtpSource> FakeVideoMediaReceiveChannel::GetSources(
-    uint32_t /* ssrc */) const {
-  return {};
 }
 bool FakeVideoMediaReceiveChannel::SetBaseMinimumPlayoutDelayMs(uint32_t ssrc,
                                                                 int delay_ms) {
@@ -625,7 +621,10 @@ FakeVoiceEngine::CreateReceiveChannel(
     Call* call,
     const MediaConfig& /* config */,
     const AudioOptions& options,
-    const CryptoOptions& /* crypto_options */) {
+    const CryptoOptions& /* crypto_options */,
+    absl::AnyInvocable<void(uint32_t ssrc)> /*on_first_packet*/,
+    absl::AnyInvocable<void(uint32_t ssrc, const RtpPacketInfos&, Timestamp)
+                           const> /* on_frame_delivered_callback */) {
   std::unique_ptr<FakeVoiceMediaReceiveChannel> ch =
       std::make_unique<FakeVoiceMediaReceiveChannel>(options,
                                                      call->network_thread());
@@ -704,7 +703,10 @@ FakeVideoEngine::CreateReceiveChannel(
     const Environment& /* env */,
     Call* call,
     const MediaConfig& /* config */,
-    const CryptoOptions& /* crypto_options */) {
+    const CryptoOptions& /* crypto_options */,
+    absl::AnyInvocable<void(uint32_t ssrc)> /*on_first_packet*/,
+    absl::AnyInvocable<void(uint32_t ssrc, const RtpPacketInfos&, Timestamp)
+                           const> /* on_frame_delivered_callback */) {
   std::unique_ptr<FakeVideoMediaReceiveChannel> ch =
       std::make_unique<FakeVideoMediaReceiveChannel>(call->network_thread());
   return ch;
@@ -767,8 +769,12 @@ void FakeVideoEngine::SetRtpHeaderExtensions(
 }
 
 FakeMediaEngine::FakeMediaEngine()
-    : CompositeMediaEngine(std::make_unique<FakeVoiceEngine>(),
-                           std::make_unique<FakeVideoEngine>()),
+    : FakeMediaEngine(std::make_unique<FakeVoiceEngine>(),
+                      std::make_unique<FakeVideoEngine>()) {}
+
+FakeMediaEngine::FakeMediaEngine(std::unique_ptr<FakeVoiceEngine> voice_engine,
+                                 std::unique_ptr<FakeVideoEngine> video_engine)
+    : CompositeMediaEngine(std::move(voice_engine), std::move(video_engine)),
       voice_(static_cast<FakeVoiceEngine*>(&voice())),
       video_(static_cast<FakeVideoEngine*>(&video())) {}
 FakeMediaEngine::~FakeMediaEngine() {}

@@ -22,7 +22,7 @@
 #include "absl/functional/any_invocable.h"
 #include "api/audio_options.h"
 #include "api/crypto/crypto_options.h"
-#include "api/field_trials.h"
+#include "api/environment/environment.h"
 #include "api/jsep.h"
 #include "api/media_types.h"
 #include "api/rtc_error.h"
@@ -60,7 +60,7 @@
 #include "rtc_base/task_queue_for_test.h"
 #include "rtc_base/thread.h"
 #include "rtc_base/unique_id_generator.h"
-#include "test/create_test_field_trials.h"
+#include "test/create_test_environment.h"
 #include "test/gmock.h"
 #include "test/gtest.h"
 #include "test/run_loop.h"
@@ -214,19 +214,19 @@ class ChannelTest : public ::testing::Test {
       // Based on flags, create fake DTLS or raw packet transports.
 
       if (flags1 & RAW_PACKET_TRANSPORT) {
-        fake_rtp_packet_transport1_.reset(
-            new FakePacketTransport("channel1_rtp"));
+        fake_rtp_packet_transport1_ =
+            std::make_unique<FakePacketTransport>(env_, "channel1_rtp");
         if (!(flags1 & RTCP_MUX)) {
-          fake_rtcp_packet_transport1_.reset(
-              new FakePacketTransport("channel1_rtcp"));
+          fake_rtcp_packet_transport1_ =
+              std::make_unique<FakePacketTransport>(env_, "channel1_rtcp");
         }
       } else {
         // Confirmed to work with KT_RSA and KT_ECDSA.
-        fake_rtp_dtls_transport1_.reset(new FakeDtlsTransport(
-            "channel1", ICE_CANDIDATE_COMPONENT_RTP, network_thread_));
+        fake_rtp_dtls_transport1_ = std::make_unique<FakeDtlsTransport>(
+            env_, "channel1", ICE_CANDIDATE_COMPONENT_RTP, network_thread_);
         if (!(flags1 & RTCP_MUX)) {
-          fake_rtcp_dtls_transport1_.reset(new FakeDtlsTransport(
-              "channel1", ICE_CANDIDATE_COMPONENT_RTCP, network_thread_));
+          fake_rtcp_dtls_transport1_ = std::make_unique<FakeDtlsTransport>(
+              env_, "channel1", ICE_CANDIDATE_COMPONENT_RTCP, network_thread_);
         }
         if (flags1 & DTLS) {
           auto cert1 = RTCCertificate::Create(
@@ -239,19 +239,19 @@ class ChannelTest : public ::testing::Test {
       }
       // Based on flags, create fake DTLS or raw packet transports.
       if (flags2 & RAW_PACKET_TRANSPORT) {
-        fake_rtp_packet_transport2_.reset(
-            new FakePacketTransport("channel2_rtp"));
+        fake_rtp_packet_transport2_ =
+            std::make_unique<FakePacketTransport>(env_, "channel2_rtp");
         if (!(flags2 & RTCP_MUX)) {
-          fake_rtcp_packet_transport2_.reset(
-              new FakePacketTransport("channel2_rtcp"));
+          fake_rtcp_packet_transport2_ =
+              std::make_unique<FakePacketTransport>(env_, "channel2_rtcp");
         }
       } else {
         // Confirmed to work with KT_RSA and KT_ECDSA.
-        fake_rtp_dtls_transport2_.reset(new FakeDtlsTransport(
-            "channel2", ICE_CANDIDATE_COMPONENT_RTP, network_thread_));
+        fake_rtp_dtls_transport2_ = std::make_unique<FakeDtlsTransport>(
+            env_, "channel2", ICE_CANDIDATE_COMPONENT_RTP, network_thread_);
         if (!(flags2 & RTCP_MUX)) {
-          fake_rtcp_dtls_transport2_.reset(new FakeDtlsTransport(
-              "channel2", ICE_CANDIDATE_COMPONENT_RTCP, network_thread_));
+          fake_rtcp_dtls_transport2_ = std::make_unique<FakeDtlsTransport>(
+              env_, "channel2", ICE_CANDIDATE_COMPONENT_RTCP, network_thread_);
         }
         if (flags2 & DTLS) {
           auto cert2 = RTCCertificate::Create(
@@ -348,7 +348,7 @@ class ChannelTest : public ::testing::Test {
       PacketTransportInternal* rtp_packet_transport,
       PacketTransportInternal* rtcp_packet_transport) {
     auto rtp_transport = std::make_unique<RtpTransport>(
-        rtcp_packet_transport == nullptr, field_trials_);
+        rtcp_packet_transport == nullptr, env_.field_trials());
 
     SendTask(network_thread_,
              [&rtp_transport, rtp_packet_transport, rtcp_packet_transport] {
@@ -364,7 +364,7 @@ class ChannelTest : public ::testing::Test {
       DtlsTransportInternal* rtp_dtls_transport,
       DtlsTransportInternal* rtcp_dtls_transport) {
     auto dtls_srtp_transport = std::make_unique<DtlsSrtpTransport>(
-        rtcp_dtls_transport == nullptr, field_trials_);
+        rtcp_dtls_transport == nullptr, env_.field_trials());
 
     SendTask(network_thread_,
              [&dtls_srtp_transport, rtp_dtls_transport, rtcp_dtls_transport] {
@@ -462,8 +462,7 @@ class ChannelTest : public ::testing::Test {
   void SendRtp(typename T::MediaSendChannel* media_channel, Buffer data) {
     network_thread_->PostTask(SafeTask(
         network_thread_safety_, [media_channel, data = std::move(data)]() {
-          media_channel->SendPacket(data.data(), data.size(),
-                                    AsyncSocketPacketOptions());
+          media_channel->SendPacket(data, AsyncSocketPacketOptions());
         }));
   }
 
@@ -514,9 +513,6 @@ class ChannelTest : public ::testing::Test {
     }
     return data;
   }
-
-  bool CheckNoRtp1() { return media_send_channel1_impl()->CheckNoRtp(); }
-  bool CheckNoRtp2() { return media_send_channel2_impl()->CheckNoRtp(); }
 
   void CreateContent(int flags,
                      const Codec& audio_codec,
@@ -600,7 +596,6 @@ class ChannelTest : public ::testing::Test {
     }
     EXPECT_TRUE(media_send_channel1_impl()->send_codecs().empty());
     EXPECT_TRUE(media_receive_channel1_impl()->recv_streams().empty());
-    EXPECT_TRUE(media_send_channel1_impl()->rtp_packets().empty());
     // Basic sanity test for send and receive channel objects
     EXPECT_EQ(channel1_->media_send_channel()->media_type(),
               media_send_channel1_impl()->media_type());
@@ -1208,8 +1203,6 @@ class ChannelTest : public ::testing::Test {
     WaitForThreads();
     EXPECT_TRUE(CheckRtp1());
     EXPECT_TRUE(CheckRtp2());
-    EXPECT_TRUE(CheckNoRtp1());
-    EXPECT_TRUE(CheckNoRtp2());
   }
 
   void TestDeinit() {
@@ -1240,8 +1233,6 @@ class ChannelTest : public ::testing::Test {
     WaitForThreads();
     EXPECT_TRUE(CheckRtp1());
     EXPECT_TRUE(CheckRtp2());
-    EXPECT_TRUE(CheckNoRtp1());
-    EXPECT_TRUE(CheckNoRtp2());
   }
 
   // Test that we can send and receive early media when a provisional answer is
@@ -1288,8 +1279,6 @@ class ChannelTest : public ::testing::Test {
     WaitForThreads(involved_threads);
     EXPECT_TRUE(CheckRtp1());
     EXPECT_TRUE(CheckRtp2());
-    EXPECT_TRUE(CheckNoRtp1());
-    EXPECT_TRUE(CheckNoRtp2());
   }
 
   // Test that the mediachannel retains its sending state after the transport
@@ -1305,8 +1294,6 @@ class ChannelTest : public ::testing::Test {
     WaitForThreads();
     EXPECT_TRUE(CheckRtp1());
     EXPECT_TRUE(CheckRtp2());
-    EXPECT_TRUE(CheckNoRtp1());
-    EXPECT_TRUE(CheckNoRtp2());
 
     // Lose writability, which should fail.
     SendTask(network_thread_,
@@ -1315,7 +1302,6 @@ class ChannelTest : public ::testing::Test {
     SendRtp2();
     WaitForThreads();
     EXPECT_TRUE(CheckRtp1());
-    EXPECT_TRUE(CheckNoRtp2());
 
     // Regain writability
     SendTask(network_thread_,
@@ -1326,8 +1312,6 @@ class ChannelTest : public ::testing::Test {
     WaitForThreads();
     EXPECT_TRUE(CheckRtp1());
     EXPECT_TRUE(CheckRtp2());
-    EXPECT_TRUE(CheckNoRtp1());
-    EXPECT_TRUE(CheckNoRtp2());
 
     // Lose writability completely
     SendTask(network_thread_, [this] {
@@ -1341,8 +1325,6 @@ class ChannelTest : public ::testing::Test {
     SendRtp2();
     WaitForThreads();
     EXPECT_TRUE(CheckRtp1());
-    EXPECT_TRUE(CheckNoRtp2());
-    EXPECT_TRUE(CheckNoRtp1());
 
     // Gain writability back
     SendTask(network_thread_, [this] {
@@ -1356,8 +1338,6 @@ class ChannelTest : public ::testing::Test {
     WaitForThreads();
     EXPECT_TRUE(CheckRtp1());
     EXPECT_TRUE(CheckRtp2());
-    EXPECT_TRUE(CheckNoRtp1());
-    EXPECT_TRUE(CheckNoRtp2());
   }
 
   void SendBundleToBundle(std::span<const int, 2> pl_types,
@@ -1384,8 +1364,6 @@ class ChannelTest : public ::testing::Test {
     WaitForThreads();
     EXPECT_TRUE(CheckCustomRtp2(kSsrc1, sequence_number1_1, pl_type1));
     EXPECT_TRUE(CheckCustomRtp1(kSsrc2, sequence_number2_2, pl_type1));
-    EXPECT_TRUE(CheckNoRtp1());
-    EXPECT_TRUE(CheckNoRtp2());
 
     SendCustomRtp1(kSsrc3, ++sequence_number1_1, pl_type2);
     SendCustomRtp2(kSsrc4, ++sequence_number2_2, pl_type2);
@@ -1769,6 +1747,7 @@ class ChannelTest : public ::testing::Test {
   }
 
   test::RunLoop main_thread_;
+  const Environment env_ = CreateTestEnvironment();
   // TODO(pbos): Remove playout from all media channels and let renderers mute
   // themselves.
   const bool verify_playout_;
@@ -1799,7 +1778,6 @@ class ChannelTest : public ::testing::Test {
   Buffer rtcp_packet_;
   CandidatePairInterface* last_selected_candidate_pair_;
   UniqueRandomIdGenerator ssrc_generator_;
-  FieldTrials field_trials_ = CreateTestFieldTrials();
 };
 
 template <>
@@ -2138,6 +2116,17 @@ TEST_F(VoiceChannelSingleThreadTest,
 TEST_F(VoiceChannelSingleThreadTest,
        TestUpdateRemoteStreamsClearsUnsignaledSinks) {
   Base::TestUpdateRemoteStreamsClearsUnsignaledSinks();
+}
+
+// The send streams are added with the local offer, but the send parameters are
+// only applied with the remote answer. Test that the MID is set with the offer,
+// so that the send streams are created with it.
+TEST_F(VoiceChannelSingleThreadTest, SetsMidOnSendChannelWithLocalOffer) {
+  CreateChannels(0, 0);
+  EXPECT_TRUE(
+      channel1_->SetLocalContent(&local_media_content1_, SdpType::kOffer).ok());
+  EXPECT_EQ(media_send_channel1_impl()->send_streams().size(), 1u);
+  EXPECT_EQ(media_send_channel1_impl()->mid(), kAudioMid);
 }
 
 // VoiceChannelDoubleThreadTest

@@ -10,6 +10,8 @@
 
 package org.webrtc;
 
+import org.jni_zero.NativeMethods;
+
 /**
  * The TimestampAligner class helps translating camera timestamps into the same timescale as is
  * used by webrtc. Some cameras have built in timestamping which is more accurate than
@@ -29,7 +31,7 @@ public class TimestampAligner {
     return Environment.builder().build().getCurrentTimeNanos();
   }
 
-  private volatile long nativeTimestampAligner;
+  private final NativeLifecycleLock lifecycleLock;
 
   @Deprecated
   public TimestampAligner() {
@@ -37,7 +39,9 @@ public class TimestampAligner {
   }
 
   public TimestampAligner(Environment webrtcEnv) {
-    nativeTimestampAligner = nativeCreateTimestampAligner(webrtcEnv.ref());
+    this.lifecycleLock =
+        new NativeLifecycleLock(
+            "TimestampAligner", TimestampAlignerJni.get().createTimestampAligner(webrtcEnv.ref()));
   }
 
   /**
@@ -46,24 +50,24 @@ public class TimestampAligner {
    * the translated timestamp.
    */
   public long translateTimestamp(long cameraTimeNs) {
-    checkNativeAlignerExists();
-    return nativeTranslateTimestamp(nativeTimestampAligner, cameraTimeNs);
+    return lifecycleLock.call(
+        nativeTimestampAligner ->
+            TimestampAlignerJni.get().translateTimestamp(nativeTimestampAligner, cameraTimeNs));
   }
 
   /** Dispose native timestamp aligner. */
   public void dispose() {
-    checkNativeAlignerExists();
-    nativeReleaseTimestampAligner(nativeTimestampAligner);
-    nativeTimestampAligner = 0;
+    lifecycleLock.dispose(
+        nativeTimestampAligner ->
+            TimestampAlignerJni.get().releaseTimestampAligner(nativeTimestampAligner));
   }
 
-  private void checkNativeAlignerExists() {
-    if (nativeTimestampAligner == 0) {
-      throw new IllegalStateException("TimestampAligner has been disposed.");
-    }
-  }
+  @NativeMethods
+  interface Natives {
+    long createTimestampAligner(long webrtcEnvRef);
 
-  private static native long nativeCreateTimestampAligner(long webrtcEnvRef);
-  private static native void nativeReleaseTimestampAligner(long timestampAligner);
-  private static native long nativeTranslateTimestamp(long timestampAligner, long cameraTimeNs);
+    void releaseTimestampAligner(long timestampAligner);
+
+    long translateTimestamp(long timestampAligner, long cameraTimeNs);
+  }
 }

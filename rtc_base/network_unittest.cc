@@ -24,10 +24,8 @@
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "api/environment/environment.h"
-#include "api/environment/environment_factory.h"
 #include "api/field_trials.h"
 #include "api/sequence_checker.h"
-#include "api/test/rtc_error_matchers.h"
 #include "rtc_base/checks.h"
 #include "rtc_base/ip_address.h"
 #include "rtc_base/logging.h"
@@ -38,6 +36,7 @@
 #include "rtc_base/network_monitor_factory.h"
 #include "rtc_base/physical_socket_server.h"
 #include "rtc_base/socket_address.h"
+#include "test/create_test_environment.h"
 #include "test/create_test_field_trials.h"
 #include "test/gmock.h"
 #include "test/gtest.h"
@@ -170,13 +169,12 @@ class NetworkTest : public ::testing::Test {
  public:
   void OnNetworksChanged() { callback_called_ = true; }
 
-  NetworkManager::Stats MergeNetworkList(
-      BasicNetworkManager& network_manager,
-      std::vector<std::unique_ptr<Network>> list,
-      bool* changed) {
-    NetworkManager::Stats stats;
-    network_manager.MergeNetworkList(std::move(list), changed, &stats);
-    return stats;
+  void MergeNetworkList(BasicNetworkManager& network_manager,
+                        std::vector<std::unique_ptr<Network>> list,
+                        bool* changed) {
+    // MergeNetworkList is protected in `BasicNetworkManager`, but
+    // `NetworkTest` is a friend.
+    network_manager.MergeNetworkList(std::move(list), changed);
   }
 
   bool IsIgnoredNetwork(BasicNetworkManager& network_manager,
@@ -269,9 +267,8 @@ class NetworkTest : public ::testing::Test {
     addr_list = AddIpv6Address(addr_list, if_name, ipv6_address, ipv6_mask, 0);
     std::vector<std::unique_ptr<Network>> result;
     bool changed;
-    NetworkManager::Stats stats;
     CallConvertIfAddrs(network_manager, addr_list, true, &result);
-    network_manager.MergeNetworkList(std::move(result), &changed, &stats);
+    network_manager.MergeNetworkList(std::move(result), &changed);
     return addr_list;
   }
 
@@ -311,9 +308,8 @@ class NetworkTest : public ::testing::Test {
     addr_list = AddIpv4Address(addr_list, if_name, ipv4_address, ipv4_mask);
     std::vector<std::unique_ptr<Network>> result;
     bool changed;
-    NetworkManager::Stats stats;
     CallConvertIfAddrs(network_manager, addr_list, true, &result);
-    network_manager.MergeNetworkList(std::move(result), &changed, &stats);
+    network_manager.MergeNetworkList(std::move(result), &changed);
     return addr_list;
   }
 
@@ -330,8 +326,7 @@ class NetworkTest : public ::testing::Test {
 #endif  // defined(WEBRTC_POSIX)
 
  protected:
-  const FieldTrials field_trials_ = CreateTestFieldTrials();
-  const Environment env_ = CreateEnvironment(&field_trials_);
+  const Environment env_ = CreateTestEnvironment();
   test::RunLoop main_thread_;
   bool callback_called_ = false;
 };
@@ -354,6 +349,23 @@ TEST_F(NetworkTest, TestNetworkConstruct) {
   EXPECT_EQ(AF_INET, ipv4_network1.family());
   EXPECT_FALSE(ipv4_network1.ignored());
   EXPECT_EQ(NetworkSlice::NO_SLICE, ipv4_network1.network_slice());
+}
+
+TEST_F(NetworkTest, ToStringDescribesNetwork) {
+  Network network("test_eth0", "Test Network Adapter 1", IPAddress(0x12345600U),
+                  24, ADAPTER_TYPE_ETHERNET);
+  network.set_id(7);
+  EXPECT_EQ(network.ToString(), "Net[Test:18.52.86.x/24:Ethernet:id=7]");
+  EXPECT_EQ(absl::StrCat(network), network.ToString());
+}
+
+TEST_F(NetworkTest, ToStringDescribesVpnAndNetworkSlice) {
+  Network network("tun0", "VPN", IPAddress(0x0A080000U), 24, ADAPTER_TYPE_VPN);
+  network.set_underlying_type_for_vpn(ADAPTER_TYPE_WIFI);
+  network.set_network_slice(NetworkSlice::UNIFIED_COMMUNICATIONS);
+  EXPECT_EQ(network.ToString(),
+            "Net[VPN:10.8.0.x/24:VPN/Wifi/UNIFIED_COMMUNICATIONS:id=0]");
+  EXPECT_EQ(absl::StrCat(network), network.ToString());
 }
 
 TEST_F(NetworkTest, TestIsIgnoredNetworkIgnoresIPsStartingWith0) {
@@ -471,11 +483,8 @@ TEST_F(NetworkTest, TestBasicMergeNetworkList) {
   std::vector<std::unique_ptr<Network>> list;
   list.push_back(ipv4_network1.Clone());
   bool changed;
-  NetworkManager::Stats stats =
       MergeNetworkList(manager, std::move(list), &changed);
   EXPECT_TRUE(changed);
-  EXPECT_EQ(stats.ipv6_network_count, 0);
-  EXPECT_EQ(stats.ipv4_network_count, 1);
   list.clear();  // It is fine to call .clear() on a moved-from vector.
 
   std::vector<const Network*> current = manager.GetNetworks();
@@ -487,10 +496,8 @@ TEST_F(NetworkTest, TestBasicMergeNetworkList) {
 
   // Replace ipv4_network1 with ipv4_network2.
   list.push_back(ipv4_network2.Clone());
-  stats = MergeNetworkList(manager, std::move(list), &changed);
+  MergeNetworkList(manager, std::move(list), &changed);
   EXPECT_TRUE(changed);
-  EXPECT_EQ(stats.ipv6_network_count, 0);
-  EXPECT_EQ(stats.ipv4_network_count, 1);
   list.clear();
 
   current = manager.GetNetworks();
@@ -504,10 +511,8 @@ TEST_F(NetworkTest, TestBasicMergeNetworkList) {
   // Add Network2 back.
   list.push_back(ipv4_network1.Clone());
   list.push_back(ipv4_network2.Clone());
-  stats = MergeNetworkList(manager, std::move(list), &changed);
+  MergeNetworkList(manager, std::move(list), &changed);
   EXPECT_TRUE(changed);
-  EXPECT_EQ(stats.ipv6_network_count, 0);
-  EXPECT_EQ(stats.ipv4_network_count, 2);
   list.clear();
 
   // Verify that we get previous instances of Network objects.
@@ -522,10 +527,8 @@ TEST_F(NetworkTest, TestBasicMergeNetworkList) {
   // notification.
   list.push_back(ipv4_network2.Clone());
   list.push_back(ipv4_network1.Clone());
-  stats = MergeNetworkList(manager, std::move(list), &changed);
+  MergeNetworkList(manager, std::move(list), &changed);
   EXPECT_FALSE(changed);
-  EXPECT_EQ(stats.ipv6_network_count, 0);
-  EXPECT_EQ(stats.ipv4_network_count, 2);
   list.clear();
 
   // Verify that we get previous instances of Network objects.
@@ -578,11 +581,8 @@ TEST_F(NetworkTest, TestIPv6MergeNetworkList) {
   SetupNetworks(&networks);
   std::vector<const Network*> original_list = CopyNetworkPointers(networks);
   bool changed = false;
-  NetworkManager::Stats stats =
-      MergeNetworkList(manager, std::move(networks), &changed);
+  MergeNetworkList(manager, std::move(networks), &changed);
   EXPECT_TRUE(changed);
-  EXPECT_EQ(stats.ipv6_network_count, 4);
-  EXPECT_EQ(stats.ipv4_network_count, 0);
   std::vector<const Network*> list = manager.GetNetworks();
   // Verify that the original members are in the merged list.
   EXPECT_THAT(list, UnorderedElementsAreArray(original_list));
@@ -966,6 +966,13 @@ TEST_F(NetworkTest, TestGetAdapterTypeFromNameMatching) {
   ClearNetworks(manager);
   ReleaseIfAddrs(addr_list);
 
+  // Tailscale interface; name is in form "tailscale<index>".
+  strcpy(if_name, "tailscale0");
+  addr_list = InstallIpv4Network(if_name, ipv4_address1, ipv4_mask, manager);
+  EXPECT_EQ(ADAPTER_TYPE_VPN, GetAdapterType(manager));
+  ClearNetworks(manager);
+  ReleaseIfAddrs(addr_list);
+
   strcpy(if_name, "lo0");
   addr_list = InstallIpv6Network(if_name, ipv6_address1, ipv6_mask, manager);
   EXPECT_EQ(ADAPTER_TYPE_LOOPBACK, GetAdapterType(manager));
@@ -1250,7 +1257,7 @@ TEST_F(NetworkTest, TestNetworkMonitoring) {
   manager.StartUpdating();
   FakeNetworkMonitor* network_monitor = GetNetworkMonitor(manager);
   EXPECT_TRUE(network_monitor && network_monitor->started());
-  EXPECT_THAT(WaitUntil([&] { return callback_called_; }, IsTrue()), IsRtcOk());
+  EXPECT_TRUE(WaitUntil([&] { return callback_called_; }));
   callback_called_ = false;
 
   // Clear the networks so that there will be network changes below.
@@ -1258,7 +1265,7 @@ TEST_F(NetworkTest, TestNetworkMonitoring) {
   // Network manager is started, so the callback is called when the network
   // monitor fires the network-change event.
   network_monitor->InovkeNetworksChangedCallbackForTesting();
-  EXPECT_THAT(WaitUntil([&] { return callback_called_; }, IsTrue()), IsRtcOk());
+  EXPECT_TRUE(WaitUntil([&] { return callback_called_; }));
 
   // Network manager is stopped.
   manager.StopUpdating();
@@ -1280,7 +1287,7 @@ TEST_F(NetworkTest, MAYBE_DefaultLocalAddress) {
                                   {this, [this]() { OnNetworksChanged(); }},
                                   &factory);
   manager.StartUpdating();
-  EXPECT_THAT(WaitUntil([&] { return callback_called_; }, IsTrue()), IsRtcOk());
+  EXPECT_TRUE(WaitUntil([&] { return callback_called_; }));
 
   // Make sure we can query default local address when an address for such
   // address family exists.
@@ -1417,12 +1424,13 @@ TEST_F(NetworkTest, IgnoresMACBasedIPv6Address) {
 }
 
 TEST_F(NetworkTest, WebRTC_AllowMACBasedIPv6Address) {
-  FieldTrials field_trials =
-      CreateTestFieldTrials("WebRTC-AllowMACBasedIPv6/Enabled/");
   std::string ipv6_address = "2607:fc20:f340:1dc8:214:22ff:fe01:2345";
   std::string ipv6_mask = "FFFF:FFFF:FFFF:FFFF:FFFF:FFFF:FFFF:FFFF";
   PhysicalSocketServer socket_server;
-  BasicNetworkManager manager(CreateEnvironment(&field_trials), &socket_server);
+  BasicNetworkManager manager(
+      CreateTestEnvironment(
+          {.field_trials = "WebRTC-AllowMACBasedIPv6/Enabled/"}),
+      &socket_server);
   manager.StartUpdating();
 
   // IPSec interface; name is in form "ipsec<index>".

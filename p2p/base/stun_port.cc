@@ -135,10 +135,10 @@ class StunBindingRequest : public StunRequest {
     return now - start_time_ <= port_->stun_keepalive_lifetime();
   }
 
-  UDPPort* port_;
+  UDPPort* const port_;
   const SocketAddress server_addr_;
 
-  Timestamp start_time_;
+  const Timestamp start_time_;
 };
 
 UDPPort::AddressResolver::AddressResolver(
@@ -178,13 +178,13 @@ bool UDPPort::AddressResolver::GetResolvedAddress(const SocketAddress& input,
   return it->second->result().GetResolvedAddress(family, output);
 }
 
-UDPPort::UDPPort(const PortParametersRef& args,
+UDPPort::UDPPort(PortParametersRef args,
                  IceCandidateType type,
                  AsyncPacketSocket* socket,
                  bool emit_local_for_anyaddress)
-    : Port(args, type),
+    : Port(std::move(args), type),
       request_manager_(
-          args.network_thread,
+          thread(),
           [this](std::span<const uint8_t> data, StunRequest* request) {
             SendStunRequest(data, request);
           }),
@@ -195,14 +195,14 @@ UDPPort::UDPPort(const PortParametersRef& args,
       dscp_(DSCP_NO_CHANGE),
       emit_local_for_anyaddress_(emit_local_for_anyaddress) {}
 
-UDPPort::UDPPort(const PortParametersRef& args,
+UDPPort::UDPPort(PortParametersRef args,
                  IceCandidateType type,
                  uint16_t min_port,
                  uint16_t max_port,
                  bool emit_local_for_anyaddress)
-    : Port(args, type, min_port, max_port),
+    : Port(std::move(args), type, min_port, max_port),
       request_manager_(
-          args.network_thread,
+          thread(),
           [this](std::span<const uint8_t> data, StunRequest* request) {
             SendStunRequest(data, request);
           }),
@@ -240,6 +240,10 @@ bool UDPPort::Init() {
       this, [this](AsyncPacketSocket* socket, const SocketAddress& address) {
         OnLocalAddressReady(socket, address);
       });
+  socket_->SubscribeCloseEvent(this,
+                               [this](AsyncPacketSocket* socket, int error) {
+                                 OnSocketClose(socket, error);
+                               });
   return true;
 }
 
@@ -250,6 +254,7 @@ UDPPort::~UDPPort() {
   socket_->UnsubscribeSentPacket(this);
   socket_->UnsubscribeReadyToSend(this);
   socket_->UnsubscribeAddressReady(this);
+  socket_->UnsubscribeCloseEvent(this);
 }
 
 void UDPPort::PrepareAddress() {
@@ -430,6 +435,21 @@ void UDPPort::OnSentPacket(AsyncPacketSocket* /* socket */,
 
 void UDPPort::OnReadyToSend(AsyncPacketSocket* /* socket */) {
   Port::OnReadyToSend();
+}
+
+void UDPPort::OnSocketClose(AsyncPacketSocket* socket, int error) {
+  RTC_DCHECK_EQ(socket, socket_);
+  RTC_LOG(LS_WARNING) << ToString()
+                      << ": UDP socket closed with error: " << error;
+  error_ = error;
+  request_manager_.Clear();
+  for (const SocketAddress& server : server_addresses_) {
+    if (!bind_request_succeeded_servers_.contains(server) &&
+        !bind_request_failed_servers_.contains(server)) {
+      OnStunBindingOrResolveRequestFailed(
+          server, STUN_ERROR_SERVER_NOT_REACHABLE, "UDP socket was closed.");
+    }
+  }
 }
 
 void UDPPort::SendStunBindingRequests() {
@@ -651,13 +671,14 @@ bool UDPPort::HasStunCandidateWithAddress(const SocketAddress& addr) const {
 }
 
 std::unique_ptr<StunPort> StunPort::Create(
-    const PortParametersRef& args,
+    PortParametersRef args,
     uint16_t min_port,
     uint16_t max_port,
     const ServerAddresses& servers,
     std::optional<TimeDelta> stun_keepalive_interval) {
   // Using `new` to access a non-public constructor.
-  auto port = absl::WrapUnique(new StunPort(args, min_port, max_port, servers));
+  auto port = absl::WrapUnique(
+      new StunPort(std::move(args), min_port, max_port, servers));
   port->set_stun_keepalive_delay(stun_keepalive_interval);
   if (!port->Init()) {
     return nullptr;
@@ -665,11 +686,15 @@ std::unique_ptr<StunPort> StunPort::Create(
   return port;
 }
 
-StunPort::StunPort(const PortParametersRef& args,
+StunPort::StunPort(PortParametersRef args,
                    uint16_t min_port,
                    uint16_t max_port,
                    const ServerAddresses& servers)
-    : UDPPort(args, IceCandidateType::kSrflx, min_port, max_port, false) {
+    : UDPPort(std::move(args),
+              IceCandidateType::kSrflx,
+              min_port,
+              max_port,
+              false) {
   set_server_addresses(servers);
 }
 

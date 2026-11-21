@@ -19,20 +19,20 @@
 #include "api/audio/audio_view.h"
 #include "api/audio_codecs/audio_format.h"
 #include "api/audio_codecs/builtin_audio_decoder_factory.h"
-#include "api/environment/environment_factory.h"
 #include "api/neteq/default_neteq_factory.h"
 #include "api/neteq/neteq.h"
 #include "modules/audio_coding/codecs/opus/opus_interface.h"
 #include "modules/audio_coding/include/audio_coding_module_typedefs.h"
 #include "modules/audio_coding/test/TestStereo.h"
 #include "rtc_base/strings/string_builder.h"
+#include "test/create_test_environment.h"
 #include "test/gtest.h"
 #include "test/testsupport/file_utils.h"
 
 namespace webrtc {
 
 OpusTest::OpusTest()
-    : neteq_(DefaultNetEqFactory().Create(CreateEnvironment(),
+    : neteq_(DefaultNetEqFactory().Create(CreateTestEnvironment(),
                                           NetEq::Config(),
                                           CreateBuiltinAudioDecoderFactory())),
       channel_a2b_(nullptr),
@@ -133,8 +133,7 @@ void OpusTest::Perform() {
   // Run Opus with 60 ms frame size.
   Run(channel_a2b_, audio_channels, 64000, 2880);
 
-  out_file_.Close();
-  out_file_standalone_.Close();
+  CloseOutFile();
 
   //
   // Test Opus stereo with packet-losses.
@@ -152,8 +151,7 @@ void OpusTest::Perform() {
   // Run Opus with 20 ms frame size, 10% packet loss.
   Run(channel_a2b_, audio_channels, 64000, 960, 10);
 
-  out_file_.Close();
-  out_file_standalone_.Close();
+  CloseOutFile();
 
   //
   // Test Mono.
@@ -185,8 +183,7 @@ void OpusTest::Perform() {
   // Run Opus with 60 ms frame size.
   Run(channel_a2b_, audio_channels, 32000, 2880);
 
-  out_file_.Close();
-  out_file_standalone_.Close();
+  CloseOutFile();
 
   //
   // Test Opus mono with packet-losses.
@@ -206,8 +203,7 @@ void OpusTest::Perform() {
   // Close the files.
   in_file_stereo_.Close();
   in_file_mono_.Close();
-  out_file_.Close();
-  out_file_standalone_.Close();
+  CloseOutFile();
 #endif
 }
 
@@ -394,13 +390,22 @@ void OpusTest::Run(TestPackStereo* channel,
 
 void OpusTest::OpenOutFile(int test_number) {
   StringBuilder sb;
-  sb << test::OutputPath() << "opustest_out_" << test_number << ".pcm";
-  out_file_.Open(sb.Release(), 48000, "wb");
+  sb << "opustest_out_" << test_number << ".pcm";
+  out_file_name_ = test::TempFilename(test::OutputPath(), sb.str());
+  out_file_.Open(out_file_name_, 48000, "wb");
 
   StringBuilder sb_standalone;
-  sb_standalone << test::OutputPath() << "opusstandalone_out_" << test_number
-                << ".pcm";
-  out_file_standalone_.Open(sb_standalone.Release(), 48000, "wb");
+  sb_standalone << "opusstandalone_out_" << test_number << ".pcm";
+  out_file_standalone_name_ =
+      test::TempFilename(test::OutputPath(), sb_standalone.str());
+  out_file_standalone_.Open(out_file_standalone_name_, 48000, "wb");
+}
+
+void OpusTest::CloseOutFile() {
+  out_file_.Close();
+  out_file_standalone_.Close();
+  EXPECT_TRUE(test::RemoveFile(out_file_name_));
+  EXPECT_TRUE(test::RemoveFile(out_file_standalone_name_));
 }
 
 }  // namespace webrtc

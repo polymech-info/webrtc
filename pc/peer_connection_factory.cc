@@ -101,7 +101,7 @@ PeerConnectionFactory::PeerConnectionFactory(
     : env_(env),
       context_(context ? context
                        : ConnectionContext::Create(env_, dependencies)),
-      codec_vendor_(media_engine(), context_->use_rtx(), env_.field_trials()),
+      codec_vendor_(media_engine(), /*rtx_enabled=*/true, env_.field_trials()),
       event_log_factory_(std::move(dependencies->event_log_factory)),
       fec_controller_factory_(std::move(dependencies->fec_controller_factory)),
       network_state_predictor_factory_(
@@ -109,6 +109,8 @@ PeerConnectionFactory::PeerConnectionFactory(
       injected_network_controller_factory_(
           std::move(dependencies->network_controller_factory)),
       neteq_factory_(std::move(dependencies->neteq_factory)),
+      video_jitter_timing_factory_(
+          std::move(dependencies->video_jitter_timing_factory)),
       decode_metronome_(std::move(dependencies->decode_metronome)),
       encode_metronome_(std::move(dependencies->encode_metronome)) {}
 
@@ -147,15 +149,17 @@ RtpCapabilities PeerConnectionFactory::GetRtpSenderCapabilities(
     case MediaType::AUDIO: {
       Codecs cricket_codecs;
       cricket_codecs = codec_vendor_.audio_send_codecs().codecs();
-      auto extensions = GetDefaultEnabledRtpHeaderExtensions(
-          media_engine()->voice(), /* field_trials= */ nullptr);
+      std::vector<RtpHeaderExtensionCapability> extensions =
+          GetDefaultEnabledRtpHeaderCapabilities(media_engine()->voice(),
+                                                 /* field_trials= */ nullptr);
       return ToRtpCapabilities(cricket_codecs, extensions);
     }
     case MediaType::VIDEO: {
       Codecs cricket_codecs;
       cricket_codecs = codec_vendor_.video_send_codecs().codecs();
-      auto extensions = GetDefaultEnabledRtpHeaderExtensions(
-          media_engine()->video(), /* field_trials= */ nullptr);
+      std::vector<RtpHeaderExtensionCapability> extensions =
+          GetDefaultEnabledRtpHeaderCapabilities(media_engine()->video(),
+                                                 /* field_trials= */ nullptr);
       return ToRtpCapabilities(cricket_codecs, extensions);
     }
     default:
@@ -172,14 +176,16 @@ RtpCapabilities PeerConnectionFactory::GetRtpReceiverCapabilities(
     case MediaType::AUDIO: {
       Codecs cricket_codecs;
       cricket_codecs = codec_vendor_.audio_recv_codecs().codecs();
-      auto extensions = GetDefaultEnabledRtpHeaderExtensions(
-          media_engine()->voice(), /* field_trials= */ nullptr);
+      std::vector<RtpHeaderExtensionCapability> extensions =
+          GetDefaultEnabledRtpHeaderCapabilities(media_engine()->voice(),
+                                                 /* field_trials= */ nullptr);
       return ToRtpCapabilities(cricket_codecs, extensions);
     }
     case MediaType::VIDEO: {
       Codecs cricket_codecs = codec_vendor_.video_recv_codecs().codecs();
-      auto extensions = GetDefaultEnabledRtpHeaderExtensions(
-          media_engine()->video(), /* field_trials= */ nullptr);
+      std::vector<RtpHeaderExtensionCapability> extensions =
+          GetDefaultEnabledRtpHeaderCapabilities(media_engine()->video(),
+                                                 /* field_trials= */ nullptr);
       return ToRtpCapabilities(cricket_codecs, extensions);
     }
     default:
@@ -392,6 +398,7 @@ std::unique_ptr<Call> PeerConnectionFactory::CreateCall_s(
   call_config.network_state_predictor_factory =
       network_state_predictor_factory_.get();
   call_config.neteq_factory = neteq_factory_.get();
+  call_config.video_jitter_timing_factory = video_jitter_timing_factory_.get();
 
   if (field_trials().IsEnabled("WebRTC-Bwe-InjectedCongestionController")) {
     RTC_LOG(LS_INFO) << "Using pcf injected network controller factory";

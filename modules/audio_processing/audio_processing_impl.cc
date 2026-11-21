@@ -185,7 +185,6 @@ int AudioFormatValidityToErrorCode(AudioFormatValidity validity) {
       return AudioProcessing::kBadNumberChannelsError;
   }
   RTC_DCHECK(false);
-  return AudioProcessing::kUnspecifiedError;
 }
 
 // Returns an AudioProcessing::Error together with the best possible option for
@@ -1952,7 +1951,7 @@ void AudioProcessingImpl::InitializeGainController1() {
       stream_analog_level = submodules_.agc_manager->recommended_analog_level();
     }
     submodules_.agc_manager = std::make_unique<AgcManagerDirect>(
-        env_, static_cast<int>(num_proc_channels()),
+        env_, num_proc_channels(),
         config_.gain_controller1.analog_gain_controller);
     if (re_creation) {
       submodules_.agc_manager->set_stream_analog_level(stream_analog_level);
@@ -1976,7 +1975,7 @@ void AudioProcessingImpl::InitializeGainController2() {
       InputVolumeController::Config{};
   submodules_.gain_controller2 = std::make_unique<GainController2>(
       env_, config_.gain_controller2, input_volume_controller_config,
-      proc_fullband_sample_rate_hz(), static_cast<int>(num_output_channels()),
+      proc_fullband_sample_rate_hz(), num_output_channels(),
       /*use_internal_vad=*/true);
   submodules_.gain_controller2->SetCaptureOutputUsed(
       capture_.capture_output_used);

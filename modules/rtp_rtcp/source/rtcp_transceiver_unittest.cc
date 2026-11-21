@@ -23,7 +23,6 @@
 #include "modules/rtp_rtcp/source/rtcp_packet/sender_report.h"
 #include "modules/rtp_rtcp/source/rtcp_packet/transport_feedback.h"
 #include "modules/rtp_rtcp/source/rtcp_transceiver_config.h"
-#include "rtc_base/buffer.h"
 #include "rtc_base/copy_on_write_buffer.h"
 #include "rtc_base/event.h"
 #include "rtc_base/task_queue_for_test.h"
@@ -38,7 +37,6 @@ namespace {
 
 using ::testing::_;
 using ::testing::AtLeast;
-using ::testing::InvokeWithoutArgs;
 using ::testing::IsNull;
 using ::testing::MockFunction;
 using ::testing::NiceMock;
@@ -69,10 +67,9 @@ TEST(RtcpTransceiverTest, SendsRtcpOnTaskQueueWhenCreatedOffTaskQueue) {
   config.clock = &clock;
   config.rtcp_transport = outgoing_transport.AsStdFunction();
   config.task_queue = queue.Get();
-  EXPECT_CALL(outgoing_transport, Call).WillRepeatedly(InvokeWithoutArgs([&] {
+  EXPECT_CALL(outgoing_transport, Call).WillRepeatedly([&] {
     EXPECT_TRUE(queue.IsCurrent());
-    return true;
-  }));
+  });
 
   RtcpTransceiver rtcp_transceiver(config);
   rtcp_transceiver.SendCompoundPacket();
@@ -87,10 +84,9 @@ TEST(RtcpTransceiverTest, SendsRtcpOnTaskQueueWhenCreatedOnTaskQueue) {
   config.clock = &clock;
   config.rtcp_transport = outgoing_transport.AsStdFunction();
   config.task_queue = queue.Get();
-  EXPECT_CALL(outgoing_transport, Call).WillRepeatedly(InvokeWithoutArgs([&] {
+  EXPECT_CALL(outgoing_transport, Call).WillRepeatedly([&] {
     EXPECT_TRUE(queue.IsCurrent());
-    return true;
-  }));
+  });
 
   std::unique_ptr<RtcpTransceiver> rtcp_transceiver;
   queue.PostTask([&] {
@@ -166,10 +162,9 @@ CopyOnWriteBuffer CreateSenderReport(uint32_t ssrc, uint32_t rtp_time) {
   rtcp::SenderReport sr;
   sr.SetSenderSsrc(ssrc);
   sr.SetRtpTimestamp(rtp_time);
-  Buffer buffer = sr.Build();
   // Switch to an efficient way creating CopyOnWriteBuffer from RtcpPacket when
   // there is one. Until then do not worry about extra memcpy in test.
-  return CopyOnWriteBuffer(buffer.data(), buffer.size());
+  return CopyOnWriteBuffer(sr.Build());
 }
 
 TEST(RtcpTransceiverTest, DoesntPostToRtcpObserverAfterCallToRemove) {
@@ -236,10 +231,7 @@ TEST(RtcpTransceiverTest, CanCallSendCompoundPacketFromAnyThread) {
   EXPECT_CALL(outgoing_transport, Call)
       // If test is slow, a periodic task may send an extra packet.
       .Times(AtLeast(3))
-      .WillRepeatedly(InvokeWithoutArgs([&] {
-        EXPECT_TRUE(queue.IsCurrent());
-        return true;
-      }));
+      .WillRepeatedly([&] { EXPECT_TRUE(queue.IsCurrent()); });
 
   RtcpTransceiver rtcp_transceiver(config);
 

@@ -57,11 +57,13 @@ in definitions for everything they declare.
 
 ### `TODO` comments
 
-Follow the [Google styleguide for `TODO` comments][goog-style-todo]. When
-referencing a WebRTC bug, prefer using the URL form (excluding the scheme part):
+Follow the [Google styleguide for `TODO` comments][goog-style-todo]. TODOs
+should have a syntax of the following form `TODO(<metadata,...>): <content>`
+When referencing a WebRTC bug, prefer using the URL form (excluding the scheme
+part):
 
 ```cpp
-// TODO: bugs.webrtc.org/12345 - Delete the hack when blocking bugs are resolved.
+// TODO(bugs.webrtc.org/42224904): Delete when blocking bugs are resolved.
 ```
 
 The short form used in commit messages, e.g. `webrtc:12345`, is discouraged.
@@ -218,6 +220,16 @@ However, WebRTC does not permit it. WebRTC (and Chrome) is compiled with the
 Kbytes (for Android Arm64).
 
 Use static_cast and take your own steps to ensure type safety.
+
+### Type casting and conversions
+
+Prefer braced initialization `Type{value}` (e.g. `int{kMaxTemporalStreams}`)
+over `static_cast<Type>(value)` when casting constants or values where narrowing
+is not intended.
+
+Braced initialization prevents accidental narrowing conversions at compile time
+and is more concise. Reserve `static_cast` for cases where explicit value
+conversions (such as narrowing or pointer conversions) are intended.
 
 ## C
 

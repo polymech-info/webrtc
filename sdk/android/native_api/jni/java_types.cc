@@ -248,7 +248,7 @@ ScopedJavaLocalRef<jstring> NativeToJavaString(
 
 ScopedJavaLocalRef<jbyteArray> NativeToJavaByteArray(
     JNIEnv* env,
-    std::span<int8_t> container) {
+    std::span<const int8_t> container) {
   jni_zero::ScopedJavaLocalRef<jbyteArray> jarray =
       jni_zero::ScopedJavaLocalRef<jbyteArray>::Adopt(
           env, env->NewByteArray(container.size()));
@@ -400,3 +400,5 @@ std::vector<std::string> JavaToStdVectorStrings(
 }
 
 }  // namespace webrtc
+
+DEFINE_JNI(JniHelper)

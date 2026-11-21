@@ -34,7 +34,6 @@ namespace webrtc {
 
 scoped_refptr<PeerConnectionFactoryInterface> CreatePeerConnectionFactory(
     Thread* network_thread,
-    Thread* worker_thread,
     Thread* signaling_thread,
     scoped_refptr<AudioDeviceModule> default_adm,
     scoped_refptr<AudioEncoderFactory> audio_encoder_factory,
@@ -47,7 +46,6 @@ scoped_refptr<PeerConnectionFactoryInterface> CreatePeerConnectionFactory(
     std::unique_ptr<FieldTrialsView> field_trials) {
   PeerConnectionFactoryDependencies dependencies;
   dependencies.network_thread = network_thread;
-  dependencies.worker_thread = worker_thread;
   dependencies.signaling_thread = signaling_thread;
   dependencies.event_log_factory = std::make_unique<RtcEventLogFactory>();
   dependencies.env = CreateEnvironment(std::move(field_trials));

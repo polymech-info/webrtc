@@ -16,6 +16,7 @@
 #include <utility>
 #include <vector>
 
+#include "absl/strings/string_view.h"
 #include "api/audio_codecs/builtin_audio_decoder_factory.h"
 #include "api/audio_codecs/builtin_audio_encoder_factory.h"
 #include "api/create_peerconnection_factory.h"
@@ -43,24 +44,21 @@
 #include "pc/peer_connection_wrapper.h"
 #include "pc/sdp_utils.h"
 #include "pc/session_description.h"
+#include "pc/test/fake_audio_capture_module.h"
+#include "pc/test/fake_rtc_certificate_generator.h"
 #include "pc/test/mock_peer_connection_observers.h"
 #include "rtc_base/checks.h"
 #include "rtc_base/rtc_certificate.h"
 #include "rtc_base/rtc_certificate_generator.h"
 #include "rtc_base/ssl_fingerprint.h"
 #include "rtc_base/thread.h"
+#include "rtc_base/virtual_socket_server.h"
 #include "test/create_test_environment.h"
 #include "test/create_test_field_trials.h"
 #include "test/gmock.h"
 #include "test/gtest.h"
 #include "test/run_loop.h"
 #include "test/wait_until.h"
-#ifdef WEBRTC_ANDROID
-#include "pc/test/android_test_initializer.h"
-#endif
-#include "pc/test/fake_audio_capture_module.h"
-#include "pc/test/fake_rtc_certificate_generator.h"
-#include "rtc_base/virtual_socket_server.h"
 
 namespace webrtc {
 
@@ -82,13 +80,9 @@ class PeerConnectionCryptoBaseTest : public ::testing::Test {
       : vss_(new VirtualSocketServer()),
         main_(vss_.get()),
         sdp_semantics_(sdp_semantics) {
-#ifdef WEBRTC_ANDROID
-    InitializeAndroidObjects();
-#endif
     pc_factory_ = CreatePeerConnectionFactory(
-        Thread::Current(), Thread::Current(), Thread::Current(),
-        FakeAudioCaptureModule::Create(), CreateBuiltinAudioEncoderFactory(),
-        CreateBuiltinAudioDecoderFactory(),
+        Thread::Current(), Thread::Current(), FakeAudioCaptureModule::Create(),
+        CreateBuiltinAudioEncoderFactory(), CreateBuiltinAudioDecoderFactory(),
         std::make_unique<VideoEncoderFactoryTemplate<
             LibvpxVp8EncoderTemplateAdapter, LibvpxVp9EncoderTemplateAdapter,
             OpenH264EncoderTemplateAdapter, LibaomAv1EncoderTemplateAdapter>>(),
@@ -99,17 +93,31 @@ class PeerConnectionCryptoBaseTest : public ::testing::Test {
         nullptr /* audio_frame_processor */, CreateTestFieldTrialsPtr());
   }
 
-  WrapperPtr CreatePeerConnection() {
-    return CreatePeerConnection(RTCConfiguration());
+  WrapperPtr CreatePeerConnection() { return CreatePeerConnection(""); }
+
+  WrapperPtr CreatePeerConnection(absl::string_view field_trials) {
+    return CreatePeerConnection(RTCConfiguration(), field_trials);
   }
 
   WrapperPtr CreatePeerConnection(const RTCConfiguration& config) {
-    return CreatePeerConnection(config, nullptr);
+    return CreatePeerConnection(config, "");
+  }
+
+  WrapperPtr CreatePeerConnection(const RTCConfiguration& config,
+                                  absl::string_view field_trials) {
+    return CreatePeerConnection(config, nullptr, field_trials);
   }
 
   WrapperPtr CreatePeerConnection(
       const RTCConfiguration& config,
       std::unique_ptr<RTCCertificateGeneratorInterface> cert_gen) {
+    return CreatePeerConnection(config, std::move(cert_gen), "");
+  }
+
+  WrapperPtr CreatePeerConnection(
+      const RTCConfiguration& config,
+      std::unique_ptr<RTCCertificateGeneratorInterface> cert_gen,
+      absl::string_view field_trials) {
     auto fake_port_allocator = std::make_unique<FakePortAllocator>(
         CreateTestEnvironment(), vss_.get());
     auto observer = std::make_unique<MockPeerConnectionObserver>();
@@ -118,6 +126,9 @@ class PeerConnectionCryptoBaseTest : public ::testing::Test {
     PeerConnectionDependencies pc_dependencies(observer.get());
     pc_dependencies.allocator = std::move(fake_port_allocator);
     pc_dependencies.cert_generator = std::move(cert_gen);
+    if (!field_trials.empty()) {
+      pc_dependencies.trials = CreateTestFieldTrialsPtr(field_trials);
+    }
     auto result = pc_factory_->CreatePeerConnectionOrError(
         modified_config, std::move(pc_dependencies));
     if (!result.ok()) {
@@ -306,6 +317,39 @@ TEST_P(PeerConnectionCryptoTest,
   ASSERT_TRUE(caller->SetRemoteDescription(std::move(answer)));
 }
 
+// The signaling and network threads are the same thread in these tests. A
+// certificate from the configuration must be usable by descriptions that are
+// applied right after the PeerConnection is created, before any posted task
+// has run.
+TEST_P(PeerConnectionCryptoTest,
+       DescriptionsAppliedRightAfterCreationUseCertificateInConfig) {
+  RTCConfiguration config;
+  config.certificates.push_back(
+      FakeRTCCertificateGenerator::GenerateCertificate());
+  auto caller = CreatePeerConnectionWithAudioVideo();
+  std::unique_ptr<SessionDescriptionInterface> offer =
+      caller->CreateOfferAndSetAsLocal();
+  ASSERT_THAT(offer, NotNull());
+  // A PeerConnection with the same certificate creates the answer, so the
+  // answer has the fingerprint of that certificate.
+  auto answerer = CreatePeerConnection(config);
+  ASSERT_TRUE(answerer->SetRemoteDescription(offer->Clone()));
+  std::unique_ptr<SessionDescriptionInterface> answer =
+      answerer->CreateAnswer();
+  ASSERT_THAT(answer, NotNull());
+
+  auto callee = CreatePeerConnection(config);
+  ASSERT_THAT(callee, NotNull());
+  auto srd_observer = make_ref_counted<FakeSetRemoteDescriptionObserver>();
+  callee->pc()->SetRemoteDescription(std::move(offer), srd_observer);
+  auto sld_observer = make_ref_counted<FakeSetLocalDescriptionObserver>();
+  callee->pc()->SetLocalDescription(std::move(answer), sld_observer);
+  ASSERT_TRUE(srd_observer->called());
+  EXPECT_THAT(srd_observer->error(), IsRtcOk());
+  ASSERT_TRUE(sld_observer->called());
+  EXPECT_THAT(sld_observer->error(), IsRtcOk());
+}
+
 // The following parameterized test verifies that CreateOffer/CreateAnswer
 // returns successfully (or with failure if the underlying certificate generator
 // fails) no matter when the DTLS certificate is generated. If multiple
@@ -408,9 +452,7 @@ TEST_P(PeerConnectionCryptoDtlsCertGenTest, TestCertificateGeneration) {
     }
   }
   for (auto& observer : observers) {
-    EXPECT_THAT(
-        WaitUntil([&] { return observer->called(); }, ::testing::IsTrue()),
-        IsRtcOk());
+    EXPECT_TRUE(WaitUntil([&] { return observer->called(); }));
     if (cert_gen_result_ == CertGenResult::kSucceed) {
       EXPECT_TRUE(observer->result());
     } else {
@@ -433,7 +475,9 @@ INSTANTIATE_TEST_SUITE_P(
 // See: https://bugs.chromium.org/p/webrtc/issues/detail?id=4525
 TEST_P(PeerConnectionCryptoTest, CreateAnswerWithDifferentSslRoles) {
   auto caller = CreatePeerConnectionWithAudioVideo();
-  auto callee = CreatePeerConnectionWithAudioVideo();
+  // Munging allowed: kDtlsSetup (24)
+  auto callee = CreatePeerConnectionWithAudioVideo(
+      "WebRTC-NoSdpMangleAllowForTesting/Enabled,24/");
 
   RTCOfferAnswerOptions options_no_bundle;
   options_no_bundle.use_rtp_mux = false;
@@ -484,10 +528,13 @@ TEST_P(PeerConnectionCryptoTest, SessionErrorIfFingerprintInvalid) {
   auto callee_certificate = RTCCertificate::FromPEM(kRsaPems[0]);
   auto other_certificate = RTCCertificate::FromPEM(kRsaPems[1]);
 
-  auto caller = CreatePeerConnectionWithAudioVideo();
+  // Munging allowed: kUnknownModification (fingerprint modification)
+  auto caller = CreatePeerConnectionWithAudioVideo(
+      RTCConfiguration(), "WebRTC-NoSdpMangleAllowForTesting/Enabled,1/");
   RTCConfiguration callee_config;
   callee_config.certificates.push_back(callee_certificate);
-  auto callee = CreatePeerConnectionWithAudioVideo(callee_config);
+  auto callee = CreatePeerConnectionWithAudioVideo(
+      callee_config, "WebRTC-NoSdpMangleAllowForTesting/Enabled,1/");
 
   ASSERT_TRUE(callee->SetRemoteDescription(caller->CreateOfferAndSetAsLocal()));
 

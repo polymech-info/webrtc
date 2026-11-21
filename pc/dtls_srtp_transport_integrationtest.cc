@@ -93,7 +93,7 @@ class DtlsSrtpTransportIntegrationTest : public ::testing::Test {
   }
   std::unique_ptr<FakeIceTransportInternal> MakeIceTransport(IceRole role) {
     auto ice_transport = std::make_unique<FakeIceTransportInternal>(
-        "fake_" + absl::StrCat(static_cast<int>(role)), 0);
+        env_, "fake_" + absl::StrCat(static_cast<int>(role)), 0);
     ice_transport->SetAsync(true);
     ice_transport->SetAsyncDelay(0);
     ice_transport->SetIceRole(role);
@@ -132,15 +132,12 @@ class DtlsSrtpTransportIntegrationTest : public ::testing::Test {
     client_ice_transport_->SetDestination(server_ice_transport_.get());
 
     // Wait for the DTLS connection to be up.
-    EXPECT_THAT(WaitUntil(
-                    [&] {
-                      return client_dtls_transport_->writable() &&
-                             server_dtls_transport_->writable();
-                    },
-                    IsTrue(),
-                    {.timeout = TimeDelta::Millis(kTimeout),
-                     .clock = &time_controller_}),
-                IsRtcOk());
+    EXPECT_TRUE(WaitUntil(
+        [&] {
+          return client_dtls_transport_->writable() &&
+                 server_dtls_transport_->writable();
+        },
+        {.timeout = TimeDelta::Millis(kTimeout), .clock = &time_controller_}));
     EXPECT_EQ(client_dtls_transport_->dtls_state(),
               DtlsTransportState::kConnected);
     EXPECT_EQ(server_dtls_transport_->dtls_state(),
@@ -175,13 +172,8 @@ class DtlsSrtpTransportIntegrationTest : public ::testing::Test {
   }
 
   CopyOnWriteBuffer CreateRtpPacket() {
-    size_t rtp_len = sizeof(kPcmuFrame);
-    size_t packet_size = rtp_len + kRtpAuthTagLen;
-    Buffer rtp_packet_buffer = Buffer::CreateUninitializedWithSize(packet_size);
-    char* rtp_packet_data = rtp_packet_buffer.data<char>();
-    memcpy(rtp_packet_data, kPcmuFrame, rtp_len);
-
-    return {rtp_packet_data, rtp_len, packet_size};
+    return CopyOnWriteBuffer(kPcmuFrame, /*capacity=*/
+                             sizeof(kPcmuFrame) + kRtpAuthTagLen);
   }
 
   void SendRtpPacketFromSrtpToDtlsSrtp() {

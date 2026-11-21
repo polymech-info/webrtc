@@ -11,10 +11,12 @@
 #include "modules/video_coding/codecs/av1/dav1d_decoder.h"
 
 #include <cstdint>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <span>
 #include <utility>
+#include <vector>
 
 #include "api/environment/environment.h"
 #include "api/environment/environment_factory.h"
@@ -46,6 +48,16 @@ constexpr uint8_t kAv1FrameWithBT709FullRangeColorSpace[] = {
     0x22, 0x02, 0x02, 0x03, 0x08, 0x32, 0x0e, 0x10, 0x00, 0xac, 0x02, 0x05,
     0x14, 0x20, 0x81, 0x00, 0x02, 0x00, 0x95, 0xe1, 0xe0};
 
+// A single temporal unit with two spatial layers of a black frame, encoded by
+// libaom as L2T1: 16x9 for the base layer and 32x18 for the top layer.
+constexpr uint8_t kAv1TemporalUnitWithTwoSpatialLayers[] = {
+    0x12, 0x00, 0x0a, 0x0b, 0x00, 0x13, 0x01, 0x00, 0x80, 0x81, 0x13,
+    0xf1, 0x00, 0x68, 0x02, 0x36, 0x00, 0x15, 0x12, 0xf4, 0xc0, 0x07,
+    0xc0, 0x04, 0x52, 0x80, 0x02, 0x08, 0x20, 0x84, 0x00, 0x09, 0x00,
+    0x39, 0x50, 0x54, 0x2f, 0xa2, 0x6c, 0x36, 0x08, 0x14, 0x30, 0xe0,
+    0x40, 0x02, 0x00, 0x01, 0xf1, 0x03, 0xff, 0xff, 0xfc, 0x5a, 0xa9,
+    0xa0, 0x01, 0x00, 0x00, 0xc5, 0x06, 0x5c};
+
 EncodedImage CreateEncodedImage(std::span<const uint8_t> data) {
   EncodedImage image;
   image.SetEncodedData(EncodedImageBuffer::Create(data.data(), data.size()));
@@ -74,10 +86,12 @@ class TestAv1Decoder : public DecodedImageCallback {
   }
 
   VideoFrame& decoded_frame() { return *decoded_frame_; }
+  int num_decoded_frames() const { return num_decoded_frames_; }
 
  private:
   int32_t Decoded(VideoFrame& decoded_frame) override {
     decoded_frame_ = std::move(decoded_frame);
+    ++num_decoded_frames_;
     return 0;
   }
   void Decoded(VideoFrame& decoded_frame,
@@ -88,6 +102,7 @@ class TestAv1Decoder : public DecodedImageCallback {
 
   const std::unique_ptr<VideoDecoder> decoder_;
   std::optional<VideoFrame> decoded_frame_;
+  int num_decoded_frames_ = 0;
 };
 
 TEST(Dav1dDecoderTest, KeepsDecodedResolutionByDefault) {
@@ -132,6 +147,64 @@ TEST(Dav1dDecoderTest, SetsColorSpaceOnDecodedFrame) {
   EXPECT_EQ(color_space->range(), ColorSpace::RangeID::kFull);
 }
 
+TEST(Dav1dDecoderTest, DecodesFrameAfterTemporalUnitWithTrailingObu) {
+  // dav1d keeps the trailing padding OBU buffered. Unless it is drained, every
+  // later dav1d_send_data() call fails with EAGAIN.
+  std::vector<uint8_t> frame_with_trailing_padding(
+      std::begin(kAv1FrameWith36x20EncodededAnd32x16RenderResolution),
+      std::end(kAv1FrameWith36x20EncodededAnd32x16RenderResolution));
+  frame_with_trailing_padding.insert(frame_with_trailing_padding.end(),
+                                     {0x7a, 0x02, 0x00, 0x00});
+
+  TestAv1Decoder decoder(CreateTestEnvironment());
+  ASSERT_EQ(decoder.Decode(CreateEncodedImage(frame_with_trailing_padding)),
+            WEBRTC_VIDEO_CODEC_OK);
+  EXPECT_EQ(decoder.decoded_frame().width(), 36);
+
+  ASSERT_EQ(decoder.Decode(CreateEncodedImage(
+                kAv1FrameWith36x20EncodededAnd32x16RenderResolution)),
+            WEBRTC_VIDEO_CODEC_OK);
+  EXPECT_EQ(decoder.decoded_frame().width(), 36);
+}
+
+TEST(Dav1dDecoderTest, OutputsOnlyTopSpatialLayerOfTemporalUnit) {
+  TestAv1Decoder decoder(CreateTestEnvironment());
+  ASSERT_EQ(
+      decoder.Decode(CreateEncodedImage(kAv1TemporalUnitWithTwoSpatialLayers)),
+      WEBRTC_VIDEO_CODEC_OK);
+  EXPECT_EQ(decoder.num_decoded_frames(), 1);
+  EXPECT_EQ(decoder.decoded_frame().width(), 32);
+  EXPECT_EQ(decoder.decoded_frame().height(), 18);
+
+  // Nothing of the unit stays buffered, so the next one decodes as well.
+  ASSERT_EQ(
+      decoder.Decode(CreateEncodedImage(kAv1TemporalUnitWithTwoSpatialLayers)),
+      WEBRTC_VIDEO_CODEC_OK);
+  EXPECT_EQ(decoder.num_decoded_frames(), 2);
+}
+
+TEST(Dav1dDecoderTest, DiscardsExtraShownFramesOfOneImage) {
+  // Not a valid temporal unit, but such an image can arrive from the network.
+  std::vector<uint8_t> two_frames(
+      std::begin(kAv1FrameWith36x20EncodededAnd32x16RenderResolution),
+      std::end(kAv1FrameWith36x20EncodededAnd32x16RenderResolution));
+  two_frames.insert(
+      two_frames.end(),
+      std::begin(kAv1FrameWith36x20EncodededAnd32x16RenderResolution),
+      std::end(kAv1FrameWith36x20EncodededAnd32x16RenderResolution));
+
+  TestAv1Decoder decoder(CreateTestEnvironment());
+  ASSERT_EQ(decoder.Decode(CreateEncodedImage(two_frames)),
+            WEBRTC_VIDEO_CODEC_OK);
+  EXPECT_EQ(decoder.num_decoded_frames(), 1);
+
+  // Nothing is left behind for the next image.
+  constexpr uint8_t kAv1TemporalDelimiter[] = {0x12, 0x00};
+  EXPECT_EQ(decoder.Decode(CreateEncodedImage(kAv1TemporalDelimiter)),
+            WEBRTC_VIDEO_CODEC_NO_OUTPUT);
+  EXPECT_EQ(decoder.num_decoded_frames(), 1);
+}
+
 TEST(Dav1dDecoderTest, FailDecoderOnTiles) {
   // This test tests buffer management, any failures would be detected
   // by running this test under ASAN.
@@ -161,6 +234,38 @@ TEST(Dav1dDecoderTest, FailDecoderOnTiles) {
   TestAv1Decoder decoder(CreateTestEnvironment());
   decoder.Decode(CreateEncodedImage(kTile0));
   decoder.Decode(CreateEncodedImage(kTile1));
+}
+
+TEST(Dav1dDecoderTest, RejectsFrameExceedingMaxSidePixels) {
+  // 33000x2 4:4:4 (High profile) keyframe: area (66000) is well below
+  // kMaxFrameSizePixels (16384^2), but width exceeds kMaxFrameSidePixels
+  // (16384) and libyuv's ScalePlane limit (32768).
+  static constexpr uint8_t kAv1Frame33000x2I444[] = {
+      0x12, 0x00, 0x0a, 0x0a, 0x20, 0x00, 0x00, 0xfb, 0xc2, 0x03, 0x9e, 0xed,
+      0x7c, 0x81, 0x32, 0xd5, 0x01, 0x10, 0x00, 0x73, 0x9c, 0xde, 0xf7, 0xce,
+      0x7c, 0x08, 0x00, 0x00, 0x00, 0x50, 0x00, 0x10, 0x00, 0x14, 0x0d, 0x18,
+      0x9c, 0xb0, 0xa1, 0xa7, 0xc8, 0x16, 0xdc, 0xb9, 0xea, 0x98, 0xe3, 0xfd,
+      0x3a, 0x77, 0x61, 0xb1, 0xda, 0xa9, 0x5e, 0x14, 0x0d, 0x18, 0x9c, 0xb0,
+      0xa1, 0xa7, 0xc8, 0x16, 0xdc, 0xb9, 0xea, 0x98, 0xe3, 0xfd, 0x3a, 0x77,
+      0x61, 0xb1, 0xda, 0xa9, 0x5e, 0x14, 0x0d, 0x18, 0x9c, 0xb0, 0xa1, 0xa7,
+      0xc8, 0x16, 0xdc, 0xb9, 0xea, 0x98, 0xe3, 0xfd, 0x3a, 0x77, 0x61, 0xb1,
+      0xda, 0xa9, 0x5e, 0x14, 0x0d, 0x18, 0x9c, 0xb0, 0xa1, 0xa7, 0xc8, 0x16,
+      0xdc, 0xb9, 0xea, 0x98, 0xe3, 0xfd, 0x3a, 0x77, 0x61, 0xb1, 0xda, 0xa9,
+      0x60, 0x14, 0x0d, 0x18, 0x9c, 0xb0, 0xa1, 0xa7, 0xc8, 0x16, 0xdc, 0xb9,
+      0xea, 0x98, 0xe3, 0xfd, 0x3a, 0x77, 0x61, 0xb1, 0xda, 0xa9, 0x60, 0x14,
+      0x0d, 0x18, 0x9c, 0xb0, 0xa1, 0xa7, 0xc8, 0x16, 0xdc, 0xb9, 0xea, 0x98,
+      0xe3, 0xfd, 0x3a, 0x77, 0x61, 0xb1, 0xda, 0xa9, 0x60, 0x14, 0x0d, 0x18,
+      0x9c, 0xb0, 0xa1, 0xa7, 0xc8, 0x16, 0xdc, 0xb9, 0xea, 0x98, 0xe3, 0xfd,
+      0x3a, 0x77, 0x61, 0xb1, 0xda, 0xa9, 0x5e, 0x14, 0x0d, 0x18, 0x9c, 0xb0,
+      0xa1, 0xa7, 0xc8, 0x16, 0xdc, 0xb9, 0xea, 0x98, 0xe3, 0xfd, 0x3a, 0x77,
+      0x61, 0xb1, 0xda, 0xa9, 0x5e, 0x0d, 0x18, 0x9c, 0xb0, 0xa1, 0xa7, 0xc8,
+      0x16, 0xdc, 0xb9, 0xea, 0x98, 0xe3, 0xfd, 0x3a, 0x77, 0x61, 0xb1, 0xda,
+      0xa9, 0x5e};
+
+  TestAv1Decoder decoder(CreateTestEnvironment());
+  EXPECT_EQ(decoder.Decode(CreateEncodedImage(kAv1Frame33000x2I444)),
+            WEBRTC_VIDEO_CODEC_ERROR);
+  EXPECT_EQ(decoder.num_decoded_frames(), 0);
 }
 
 }  // namespace

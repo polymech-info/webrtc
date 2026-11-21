@@ -13,12 +13,8 @@
 #include <string>
 
 #include "api/environment/environment.h"
-#include "api/test/rtc_error_matchers.h"
-#include "rtc_base/random.h"
-#include "rtc_base/time_utils.h"
 #include "rtc_tools/network_tester/test_controller.h"
 #include "test/create_test_environment.h"
-#include "test/gmock.h"
 #include "test/gtest.h"
 #include "test/run_loop.h"
 #include "test/testsupport/file_utils.h"
@@ -27,27 +23,26 @@
 namespace webrtc {
 
 TEST(NetworkTesterTest, ServerClient) {
-  // Use a unique port rather than a hard-coded one to avoid collision when
-  // running the test in parallel in stress runs. Skipping all reserved ports.
-  const int MIN_PORT = 49152;
-  const int MAX_PORT = 65535;
-  int port = Random(TimeMicros()).Rand(MIN_PORT, MAX_PORT);
-
   test::RunLoop main_thread;
   Environment env = CreateTestEnvironment();
 
-  TestController client(
-      env, 0, 0, test::ResourcePath("network_tester/client_config", "dat"),
-      test::OutputPath() + "client_packet_log.dat");
-  TestController server(
-      env, port, port,
-      test::ResourcePath("network_tester/server_config", "dat"),
-      test::OutputPath() + "server_packet_log.dat");
-  client.SendConnectTo("127.0.0.1", port);
-  EXPECT_THAT(
-      WaitUntil([&] { return server.IsTestDone() && client.IsTestDone(); },
-                ::testing::IsTrue()),
-      IsRtcOk());
+  const std::string client_log =
+      test::TempFilename(test::OutputPath(), "client_packet_log.dat");
+  const std::string server_log =
+      test::TempFilename(test::OutputPath(), "server_packet_log.dat");
+  {
+    TestController client(
+        env, 0, 0, test::ResourcePath("network_tester/client_config", "dat"),
+        client_log);
+    TestController server(
+        env, 0, 0, test::ResourcePath("network_tester/server_config", "dat"),
+        server_log);
+    client.SendConnectTo("127.0.0.1", server.local_port());
+    EXPECT_TRUE(
+        WaitUntil([&] { return server.IsTestDone() && client.IsTestDone(); }));
+  }
+  EXPECT_TRUE(test::RemoveFile(client_log));
+  EXPECT_TRUE(test::RemoveFile(server_log));
 }
 
 }  // namespace webrtc

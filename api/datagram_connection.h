@@ -19,6 +19,7 @@
 #include "absl/strings/string_view.h"
 #include "api/candidate.h"
 #include "api/ref_count.h"
+#include "api/transport/ecn_marking.h"
 #include "api/units/timestamp.h"
 #include "p2p/base/transport_description.h"
 #include "rtc_base/system/rtc_export.h"
@@ -36,6 +37,12 @@ class RTC_EXPORT DatagramConnection : public RefCountInterface {
   enum class WireProtocol {
     kDtls,
     kDtlsSrtp,
+    // DTLS-only transport that additionally frames every payload with a small
+    // transport header (packet type + transport sequence number). This is the
+    // wire-format foundation for carrying congestion-control feedback inside
+    // the DTLS records; the feedback codec itself is not part of this mode yet.
+    // See DtlsPacketProcessor.
+    kDtlsWithFeedback,
   };
 
   using PacketId = uint32_t;
@@ -47,6 +54,8 @@ class RTC_EXPORT DatagramConnection : public RefCountInterface {
 
     struct PacketMetadata {
       Timestamp receive_time;
+      // ECN marking of the IP packet as received from the network.
+      EcnMarking ecn = EcnMarking::kNotEct;
     };
     virtual void OnPacketReceived(std::span<const uint8_t> data,
                                   PacketMetadata metadata) = 0;

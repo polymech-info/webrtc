@@ -81,8 +81,9 @@ class TransmissionControlBlock : public Context {
     return tx_error_counter_.IsExhausted();
   }
   void Send(SctpPacket::Builder& builder) override {
-    packet_sender_.Send(builder,
-                        /*write_checksum=*/!capabilities_.zero_checksum);
+    packet_sender_.Send(
+        builder,
+        /*write_checksum=*/!capabilities_.zero_checksum_enabled());
   }
 
   // Other accessors
@@ -125,7 +126,7 @@ class TransmissionControlBlock : public Context {
 
   bool has_cookie_echo_chunk() const { return cookie_echo_chunk_.has_value(); }
 
-  void MaybeSendFastRetransmit();
+  void MaybeSendFastRetransmit(webrtc::Timestamp now);
 
   // Fills `builder` (which may already be filled with control chunks) with
   // other control and data chunks, and sends packets as much as can be
@@ -145,14 +146,20 @@ class TransmissionControlBlock : public Context {
 
   HandoverReadinessStatus GetHandoverReadiness() const;
 
-  void AddHandoverState(DcSctpSocketHandoverState& state);
-  void RestoreFromState(const DcSctpSocketHandoverState& handover_state);
+  void AddHandoverState(webrtc::Timestamp now,
+                        DcSctpSocketHandoverState& state);
+  void RestoreFromState(webrtc::Timestamp now,
+                        const DcSctpSocketHandoverState& handover_state);
 
  private:
   // Will be called when the retransmission timer (t3-rtx) expires.
   webrtc::TimeDelta OnRtxTimerExpiry();
   // Will be called when the delayed ack timer expires.
   webrtc::TimeDelta OnDelayedAckTimerExpiry();
+  // Returns true if a FORWARD-TSN with `new_cumulative_tsn` should be sent
+  // now, taking rate limiting of duplicate FORWARD-TSN chunks into account. If
+  // it returns true, the caller is expected to send it.
+  bool ShouldSendForwardTsnChunk(TSN new_cumulative_tsn, webrtc::Timestamp now);
 
   const absl::string_view log_prefix_;
   const DcSctpOptions options_;
@@ -172,8 +179,11 @@ class TransmissionControlBlock : public Context {
   const TieTag tie_tag_;
   const std::function<bool()> is_connection_established_;
   PacketSender& packet_sender_;
-  // Rate limiting of FORWARD-TSN. Next can be sent at or after this timestamp.
+  // Rate limiting of duplicate FORWARD-TSN. A FORWARD-TSN with the same
+  // cumulative TSN as `last_sent_forward_tsn_` can be sent at or after this
+  // timestamp.
   webrtc::Timestamp limit_forward_tsn_until_ = webrtc::Timestamp::Zero();
+  TSN last_sent_forward_tsn_ = TSN(*my_initial_tsn_ - 1);
 
   RetransmissionTimeout rto_;
   RetransmissionErrorCounter tx_error_counter_;

@@ -23,6 +23,7 @@
 
 #include "absl/base/nullability.h"
 #include "absl/functional/any_invocable.h"
+#include "absl/strings/str_format.h"
 #include "absl/strings/string_view.h"
 #include "api/environment/environment.h"
 #include "api/field_trials_view.h"
@@ -178,15 +179,6 @@ class RTC_EXPORT NetworkManager : public DefaultLocalAddressProvider,
   virtual void DumpNetworks() {}
   bool GetDefaultLocalAddress(int family, IPAddress* ipaddr) const override;
 
-  struct Stats {
-    int ipv4_network_count;
-    int ipv6_network_count;
-    Stats() {
-      ipv4_network_count = 0;
-      ipv6_network_count = 0;
-    }
-  };
-
   // MdnsResponderProvider interface.
   MdnsResponderInterface* GetMdnsResponder() const override;
 
@@ -308,7 +300,7 @@ class RTC_EXPORT Network {
 
   // `key_` has unique value per network interface. Used in sorting network
   // interfaces. Key is derived from interface name and it's prefix.
-  std::string key() const { return key_; }
+  const std::string& key() const { return key_; }
 
   // Returns the Network's current idea of the 'best' IP it has.
   // Or return an unset IP if this network has no active addresses.
@@ -454,6 +446,28 @@ class RTC_EXPORT Network {
   // Debugging description of this network
   std::string ToString() const;
 
+  // Writes the same description as ToString() to `sink`, without creating a
+  // temporary string, e.g. when appending the description to a StringBuilder.
+  template <typename Sink>
+  friend void AbslStringify(Sink& sink, const Network& network) {
+    // Print out the first space-terminated token of the network desc, plus
+    // the IP address.
+    absl::string_view description = network.description_;
+    absl::Format(&sink, "Net[%s:%v/%d:%s",
+                 description.substr(0, description.find(' ')),
+                 IPAddress::Sensitive(network.prefix_), network.prefix_length_,
+                 AdapterTypeToString(network.type_));
+    if (network.IsVpn()) {
+      sink.Append("/");
+      sink.Append(AdapterTypeToString(network.underlying_type_for_vpn_));
+    }
+    if (network.network_slice_ != NetworkSlice::NO_SLICE) {
+      sink.Append("/");
+      sink.Append(NetworkSliceToString(network.network_slice_));
+    }
+    absl::Format(&sink, ":id=%d]", network.id_);
+  }
+
  private:
   const DefaultLocalAddressProvider* default_local_address_provider_ = nullptr;
   const MdnsResponderProvider* mdns_responder_provider_ = nullptr;
@@ -503,11 +517,6 @@ class RTC_EXPORT NetworkManagerBase : public NetworkManager {
   // any change in the network list.
   void MergeNetworkList(std::vector<std::unique_ptr<Network>> list,
                         bool* changed);
-
-  // `stats` will be populated even if |*changed| is false.
-  void MergeNetworkList(std::vector<std::unique_ptr<Network>> list,
-                        bool* changed,
-                        NetworkManager::Stats* stats);
 
   void set_enumeration_permission(EnumerationPermission state) {
     enumeration_permission_ = state;

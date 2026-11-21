@@ -23,6 +23,7 @@
 #include "api/environment/environment.h"
 #include "api/scoped_refptr.h"
 #include "api/sequence_checker.h"
+#include "api/transport/ecn_marking.h"
 #include "api/units/timestamp.h"
 #include "call/rtp_packet_sink_interface.h"
 #include "p2p/base/ice_transport_internal.h"
@@ -32,6 +33,7 @@
 #include "p2p/dtls/dtls_transport_internal.h"
 #include "pc/dtls_srtp_transport.h"
 #include "pc/dtls_transport.h"
+#include "pc/packet_processor.h"
 #include "rtc_base/checks.h"
 #include "rtc_base/copy_on_write_buffer.h"
 #include "rtc_base/network/sent_packet.h"
@@ -77,7 +79,9 @@ class RTC_EXPORT DatagramConnectionInternal : public DatagramConnection,
   // RtpPacketSinkInterface
   void OnRtpPacket(const RtpPacketReceived& packet) override;
 
-  void OnDtlsPacket(CopyOnWriteBuffer packet, Timestamp receive_time);
+  void OnDtlsPacket(CopyOnWriteBuffer packet,
+                    Timestamp receive_time,
+                    EcnMarking ecn);
 
   void OnSentPacket(const SentPacketInfo& packet);
 
@@ -101,6 +105,7 @@ class RTC_EXPORT DatagramConnectionInternal : public DatagramConnection,
   enum class State { kActive, kTerminated };
   State current_state_ = State::kActive;
 
+  const Environment env_;
   const WireProtocol wire_protocol_;
 
   // Must be before Transport types, to ensure it outlives them.
@@ -118,6 +123,8 @@ class RTC_EXPORT DatagramConnectionInternal : public DatagramConnection,
 
   const std::string ice_username_fragment_;
   const std::string ice_password_;
+
+  std::unique_ptr<PacketProcessor> packet_processor_;
 };
 
 }  // namespace webrtc

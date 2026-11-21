@@ -379,18 +379,15 @@ std::unique_ptr<ClippingPredictor> CreateClippingPredictor(
     case ClippingPredictorMode::kAdaptiveStepClippingPeakPrediction:
       return std::make_unique<ClippingPeakPredictor>(
           num_channels, config.window_length, config.reference_window_length,
-          config.reference_window_delay,
-          static_cast<int>(config.clipping_threshold),
+          config.reference_window_delay, config.clipping_threshold,
           /*adaptive_step_estimation=*/true);
     case ClippingPredictorMode::kFixedStepClippingPeakPrediction:
       return std::make_unique<ClippingPeakPredictor>(
           num_channels, config.window_length, config.reference_window_length,
-          config.reference_window_delay,
-          static_cast<int>(config.clipping_threshold),
+          config.reference_window_delay, config.clipping_threshold,
           /*adaptive_step_estimation=*/false);
   }
   RTC_DCHECK_NOTREACHED();
-  return nullptr;
 }
 
 }  // namespace webrtc

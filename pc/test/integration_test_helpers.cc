@@ -318,8 +318,8 @@ void PeerConnectionIntegrationWrapper::CreateDataChannel(
   ASSERT_TRUE(data_channel_or_error.ok());
   data_channels_.push_back(data_channel_or_error.MoveValue());
   ASSERT_TRUE(data_channels_.back().get() != nullptr);
-  data_observers_.push_back(
-      std::make_unique<MockDataChannelObserver>(data_channels_.back().get()));
+  data_observers_.push_back(std::make_unique<MockDataChannelObserver>(
+      network_thread_, data_channels_.back().get()));
 }
 
 DataChannelInterface* PeerConnectionIntegrationWrapper::data_channel() {
@@ -395,6 +395,18 @@ PeerConnectionIntegrationWrapper::NewGetStats(test::RunLoop& run_loop) {
   scoped_refptr<const RTCStatsReport> report;
   auto callback = RTCStatsObtainer::Create(&report, run_loop.QuitClosure());
   peer_connection_->GetStats(callback.get());
+  run_loop.Run();
+  EXPECT_TRUE(report);
+  return report;
+}
+
+scoped_refptr<const RTCStatsReport>
+PeerConnectionIntegrationWrapper::NewGetStats(
+    scoped_refptr<RtpReceiverInterface> selector,
+    test::RunLoop& run_loop) {
+  scoped_refptr<const RTCStatsReport> report;
+  auto callback = RTCStatsObtainer::Create(&report, run_loop.QuitClosure());
+  peer_connection_->GetStats(std::move(selector), callback);
   run_loop.Run();
   EXPECT_TRUE(report);
   return report;
@@ -508,6 +520,10 @@ PeerConnectionIntegrationWrapper::ice_gathering_state() {
 }
 
 void PeerConnectionIntegrationWrapper::ResetRtpReceiverObservers() {
+  for (const scoped_refptr<RtpReceiverInterface>& receiver :
+       pc()->GetReceivers()) {
+    receiver->SetObserver(nullptr);
+  }
   rtp_receiver_observers_.clear();
   for (const scoped_refptr<RtpReceiverInterface>& receiver :
        pc()->GetReceivers()) {
@@ -576,6 +592,8 @@ void PeerConnectionIntegrationWrapper::StartWatchingDelayStats() {
   audio_delay_stat_ = *rtp_stats->relative_packet_arrival_delay;
   audio_samples_stat_ = *rtp_stats->total_samples_received;
   audio_concealed_stat_ = *rtp_stats->concealed_samples;
+  initial_audio_samples_stat_ = audio_samples_stat_;
+  initial_audio_concealed_stat_ = audio_concealed_stat_;
 }
 
 void PeerConnectionIntegrationWrapper::UpdateDelayStats(std::string tag,
@@ -628,16 +646,21 @@ void PeerConnectionIntegrationWrapper::UpdateDelayStats(std::string tag,
   // TODO(https://crbug.com/webrtc/15393): Improve audio quality during
   // renegotiation so that we can reduce these thresholds, 99% is not even
   // close to the 20% deemed unacceptable above or the 0% that would be ideal.
-  // Require at least 2000 samples (roughly 2x 20ms packets).
-  if (delta_samples >= 2000) {
+  // Require at least 2000 samples (roughly 2x 20ms packets) across
+  // renegotiation steps.
+  auto total_samples =
+      *rtp_stats->total_samples_received - initial_audio_samples_stat_;
+  auto total_concealed =
+      *rtp_stats->concealed_samples - initial_audio_concealed_stat_;
+  if (total_samples >= 2000) {
     audio_delay_stats_percentage_checked_ = true;
 #if !defined(NDEBUG)
-    EXPECT_LT(1.0 * delta_concealed / delta_samples, 0.99)
-        << "Concealed " << delta_concealed << " of " << delta_samples
+    EXPECT_LT(1.0 * total_concealed / total_samples, 0.99)
+        << "Concealed " << total_concealed << " of " << total_samples
         << " samples";
 #else
-    EXPECT_LT(1.0 * delta_concealed / delta_samples, 0.7)
-        << "Concealed " << delta_concealed << " of " << delta_samples
+    EXPECT_LT(1.0 * total_concealed / total_samples, 0.7)
+        << "Concealed " << total_concealed << " of " << total_samples
         << " samples";
 #endif
   }
@@ -750,7 +773,6 @@ bool PeerConnectionIntegrationWrapper::Init(
     PeerConnectionDependencies dependencies,
     SocketServer* socket_server,
     Thread* network_thread,
-    Thread* worker_thread,
     std::unique_ptr<FakeRtcEventLogFactory> event_log_factory,
     bool reset_encoder_factory,
     bool reset_decoder_factory,
@@ -775,7 +797,6 @@ bool PeerConnectionIntegrationWrapper::Init(
 
   PeerConnectionFactoryDependencies pc_factory_dependencies;
   pc_factory_dependencies.network_thread = network_thread;
-  pc_factory_dependencies.worker_thread = worker_thread;
   pc_factory_dependencies.signaling_thread = signaling_thread;
   pc_factory_dependencies.socket_factory = socket_server;
   pc_factory_dependencies.network_manager = std::move(network_manager);
@@ -1101,8 +1122,10 @@ void PeerConnectionIntegrationWrapper::OnIceCandidate(
       EXPECT_CALL(*remote_async_dns_resolver_, result())
           .WillOnce(ReturnRef(remote_async_dns_resolver_result_));
       EXPECT_CALL(remote_async_dns_resolver_result_, GetResolvedAddress(_, _))
-          .WillOnce(DoAll(SetArgPointee<1>(remote_async_dns_resolved_addr_),
-                          Return(true)));
+          .WillOnce([this](int /*family*/, SocketAddress* addr) {
+            *addr = remote_async_dns_resolved_addr_;
+            return true;
+          });
     }
   }
 
@@ -1134,8 +1157,8 @@ void PeerConnectionIntegrationWrapper::OnDataChannel(
     scoped_refptr<DataChannelInterface> data_channel) {
   RTC_LOG(LS_INFO) << debug_name_ << ": OnDataChannel";
   data_channels_.push_back(data_channel);
-  data_observers_.push_back(
-      std::make_unique<MockDataChannelObserver>(data_channel.get()));
+  data_observers_.push_back(std::make_unique<MockDataChannelObserver>(
+      network_thread_, data_channel.get()));
 }
 
 bool PeerConnectionIntegrationWrapper::IdExists(
@@ -1151,21 +1174,6 @@ bool PeerConnectionIntegrationWrapper::IdExists(
 
 namespace internal {
 
-// Utility class for tests that run multiple operations that cause excessive
-// logging at the INFO level or below. Use to raise the logging level to e.g.
-// LS_WARNING or above. Once an instance of ScopedSetLoggingLevel goes out of
-// scope, the logging level is restored to what it was previously set to.
-class PeerConnectionIntegrationTestBase::ScopedSetLoggingLevel {
- public:
-  explicit ScopedSetLoggingLevel(LoggingSeverity new_severity) {
-    LogMessage::LogToDebug(new_severity);
-  }
-  ~ScopedSetLoggingLevel() { LogMessage::LogToDebug(previous_severity_); }
-
- private:
-  const LoggingSeverity previous_severity_ = LogMessage::GetLogToDebug();
-};
-
 PeerConnectionIntegrationTestBase::PeerConnectionIntegrationTestBase(
     Environment env,
     SdpSemantics sdp_semantics)
@@ -1173,12 +1181,9 @@ PeerConnectionIntegrationTestBase::PeerConnectionIntegrationTestBase(
       env_(std::move(env)),
       ss_(new VirtualSocketServer()),
       fss_(new FirewallSocketServer(ss_.get(), nullptr, false)),
-      network_thread_(new Thread(fss_.get())),
-      worker_thread_(Thread::Create()) {
+      network_thread_(new Thread(fss_.get())) {
   network_thread_->SetName("PCNetworkThread", this);
-  worker_thread_->SetName("PCWorkerThread", this);
   RTC_CHECK(network_thread_->Start());
-  RTC_CHECK(worker_thread_->Start());
   metrics::Reset();
 }
 
@@ -1191,9 +1196,7 @@ PeerConnectionIntegrationTestBase::PeerConnectionIntegrationTestBase(
   fss_ = std::make_unique<FirewallSocketServer>(ss_.get(), nullptr, false);
   network_thread_ = time_controller->CreateThreadWithSocketServer(
       "PCNetworkThread", fss_.get());
-  worker_thread_ = time_controller->CreateThread("PCWorkerThread");
   network_thread_->SetName("PCNetworkThread", this);
-  worker_thread_->SetName("PCWorkerThread", this);
   metrics::Reset();
 }
 
@@ -1268,7 +1271,7 @@ PeerConnectionIntegrationTestBase::CreatePeerConnectionWrapper(
       CreatePeerConnectionWrapperInternal(debug_name, env.Create());
 
   if (!client->Init(options, &modified_config, std::move(dependencies),
-                    fss_.get(), network_thread_.get(), worker_thread_.get(),
+                    fss_.get(), network_thread_.get(),
                     std::move(event_log_factory), reset_encoder_factory,
                     reset_decoder_factory, create_media_engine)) {
     return nullptr;
@@ -1499,15 +1502,7 @@ void PeerConnectionIntegrationTestBase::DestroyTurnServers() {
 }
 
 void PeerConnectionIntegrationTestBase::DestroyThreads() {
-  worker_thread_.reset();
   network_thread_.reset();
-}
-
-void PeerConnectionIntegrationTestBase::OverrideLoggingLevelForTest(
-    LoggingSeverity new_severity) {
-  RTC_DCHECK(!overridden_logging_level_);
-  overridden_logging_level_ =
-      std::make_unique<ScopedSetLoggingLevel>(new_severity);
 }
 
 void PeerConnectionIntegrationTestBase::DestroyPeerConnections() {

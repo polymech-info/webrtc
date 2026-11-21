@@ -26,6 +26,7 @@ set(WEBRTC_APM_SOURCES
     api/audio/echo_canceller3_config.cc
     api/environment/deprecated_global_field_trials.cc
     api/environment/environment_factory.cc
+    api/environment/force_test_environment.cc
     api/field_trials.cc
     api/field_trials_registry.cc
     api/rtc_event_log/rtc_event_log.cc
@@ -53,9 +54,7 @@ set(WEBRTC_APM_SOURCES
     common_audio/resampler/sinusoidal_linear_chirp_source.cc
     common_audio/ring_buffer.c
     common_audio/signal_processing/auto_corr_to_refl_coef.c
-    common_audio/signal_processing/auto_correlation.c
-    common_audio/signal_processing/complex_bit_reverse.c
-    common_audio/signal_processing/complex_fft.c
+    common_audio/signal_processing/auto_correlation.cc
     common_audio/signal_processing/copy_set_operations.c
     common_audio/signal_processing/cross_correlation.c
     common_audio/signal_processing/division_operations.c
@@ -83,7 +82,7 @@ set(WEBRTC_APM_SOURCES
     common_audio/signal_processing/spl_inl.c
     common_audio/signal_processing/spl_sqrt.c
     common_audio/signal_processing/splitting_filter.c
-    common_audio/signal_processing/sqrt_of_one_minus_x_squared.c
+    common_audio/signal_processing/vector_operations.c
     common_audio/signal_processing/vector_scaling_operations.c
     common_audio/smoothing_filter.cc
     common_audio/third_party/ooura/fft_size_128/ooura_fft.cc

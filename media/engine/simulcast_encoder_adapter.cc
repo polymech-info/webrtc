@@ -437,6 +437,10 @@ int SimulcastEncoderAdapter::InitEncode(
   // The use of the nonstandard x-google-per-layer-pli fmtp parameter also
   // forces the use of SEA with separate encoders to support per-layer
   // handling of PLIs.
+  // We do not force separate encoders when WebRTC-Video-PerSsrcKeyframes is
+  // enabled, because using a single encoder that supports simulcast is more
+  // efficient (less CPU overhead) than running multiple encoders, and the
+  // single encoder might natively support per-layer keyframe generation.
   bool separate_encoders_needed =
       is_mixed_codec ||
       !encoder_context->encoder().GetEncoderInfo().supports_simulcast ||
@@ -659,7 +663,7 @@ int SimulcastEncoderAdapter::Encode(
             });
       } else {
         size_t stream_idx = static_cast<size_t>(layer.stream_idx());
-        if (frame_types->size() >= stream_idx &&
+        if (frame_types->size() > stream_idx &&
             (*frame_types)[stream_idx] == VideoFrameType::kVideoFrameKey) {
           stream_frame_types[0] = VideoFrameType::kVideoFrameKey;
           keyframe_requested = true;
@@ -799,6 +803,34 @@ void SimulcastEncoderAdapter::SetRates(
         layer_context.target_fps().value_or(parameters.framerate_fps));
 
     layer_context.encoder().SetRates(stream_parameters);
+  }
+}
+
+void SimulcastEncoderAdapter::SetComplexity(
+    std::span<const VideoCodecComplexity> complexity_by_spatial_layer,
+    ComplexityControlMode complexity_control_mode) {
+  RTC_DCHECK_RUN_ON(&encoder_queue_checker_);
+
+  if (!Initialized()) {
+    RTC_LOG(LS_WARNING) << "SetComplexity while not initialized";
+    return;
+  }
+
+  if (bypass_mode_) {
+    stream_contexts_.front().encoder().SetComplexity(
+        complexity_by_spatial_layer, complexity_control_mode);
+    return;
+  }
+
+  for (StreamContext& layer_context : stream_contexts_) {
+    size_t stream_idx = checked_cast<size_t>(layer_context.stream_idx());
+    VideoCodecComplexity complexity =
+        complexity_by_spatial_layer.empty()
+            ? VideoCodecComplexity::kComplexityNormal
+            : complexity_by_spatial_layer[std::min(
+                  stream_idx, complexity_by_spatial_layer.size() - 1)];
+    layer_context.encoder().SetComplexity({&complexity, 1},
+                                          complexity_control_mode);
   }
 }
 
@@ -969,8 +1001,8 @@ SimulcastEncoderAdapter::FetchOrCreateEncoderContext(
     }
 
     encoder_context = std::make_unique<SimulcastEncoderAdapter::EncoderContext>(
-        std::move(encoder), prefer_temporal_support, primary_info,
-        fallback_info, std::move(video_format));
+        std::move(encoder), prefer_temporal_support, std::move(primary_info),
+        std::move(fallback_info), std::move(video_format));
   }
 
   encoder_context->encoder().RegisterEncodeCompleteCallback(
@@ -1149,6 +1181,12 @@ VideoEncoder::EncoderInfo SimulcastEncoderAdapter::GetEncoderInfo() const {
     encoder_info.requested_resolution_alignment =
         std::lcm(primary_info.requested_resolution_alignment,
                  fallback_info.requested_resolution_alignment);
+    // Query the encoder object itself, not `primary_info`: with a fallback
+    // factory it is a software fallback wrapper, which reports its fallback
+    // encoder's limit. This keeps the value identical to what the per-layer
+    // encoders report after InitEncode.
+    encoder_info.max_pixels_per_frame =
+        encoder_context->encoder().GetEncoderInfo().max_pixels_per_frame;
 
     encoder_info.apply_alignment_to_all_simulcast_layers =
         primary_info.apply_alignment_to_all_simulcast_layers ||
@@ -1195,6 +1233,7 @@ VideoEncoder::EncoderInfo SimulcastEncoderAdapter::GetEncoderInfo() const {
       encoder_info.is_hardware_accelerated =
           encoder_impl_info.is_hardware_accelerated;
       encoder_info.is_qp_trusted = encoder_impl_info.is_qp_trusted;
+      encoder_info.min_qp = encoder_impl_info.min_qp;
     } else {
       // Native handle supported if any encoder supports it.
       encoder_info.supports_native_handle |=
@@ -1216,6 +1255,10 @@ VideoEncoder::EncoderInfo SimulcastEncoderAdapter::GetEncoderInfo() const {
       encoder_info.is_qp_trusted =
           encoder_info.is_qp_trusted.value_or(true) &&
           encoder_impl_info.is_qp_trusted.value_or(true);
+
+      if (encoder_info.min_qp != encoder_impl_info.min_qp) {
+        encoder_info.min_qp = std::nullopt;
+      }
     }
     // If any encoder wants CPU overuse detection, enable it for all of them
     encoder_info.enable_cpu_overuse_detection |=
@@ -1224,6 +1267,15 @@ VideoEncoder::EncoderInfo SimulcastEncoderAdapter::GetEncoderInfo() const {
     encoder_info.requested_resolution_alignment =
         std::lcm(encoder_info.requested_resolution_alignment,
                  encoder_impl_info.requested_resolution_alignment);
+    // Smallest limit across sub-encoders. Conservative: a limit reported by
+    // a low-resolution layer's encoder is applied to the full-size source.
+    if (encoder_impl_info.max_pixels_per_frame.has_value() &&
+        (!encoder_info.max_pixels_per_frame.has_value() ||
+         *encoder_impl_info.max_pixels_per_frame <
+             *encoder_info.max_pixels_per_frame)) {
+      encoder_info.max_pixels_per_frame =
+          encoder_impl_info.max_pixels_per_frame;
+    }
     // request alignment on all layers if any of the encoders may need it, or
     // if any non-top layer encoder requests a non-trivial alignment.
     if (encoder_impl_info.apply_alignment_to_all_simulcast_layers ||

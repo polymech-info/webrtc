@@ -115,7 +115,11 @@ class DataChannelController : public SctpDataChannelControllerInterface,
   Thread* signaling_thread() const;
 
  private:
-  void OnSctpDataChannelClosed(SctpDataChannel* channel);
+  // Releases the sid of `channel`, stops tracking the channel and returns the
+  // reference to it that `sctp_data_channels_n_` held (or null if the channel
+  // wasn't tracked).
+  scoped_refptr<SctpDataChannel> OnSctpDataChannelClosed(
+      SctpDataChannel* channel);
 
   // Creates a new SctpDataChannel object on the network thread.
   RTCErrorOr<scoped_refptr<SctpDataChannel>> CreateDataChannel(
@@ -130,8 +134,8 @@ class DataChannelController : public SctpDataChannelControllerInterface,
       RTC_RUN_ON(network_thread());
   // Called when a valid data channel OPEN message is received.
   void OnDataChannelOpenMessage(scoped_refptr<SctpDataChannel> channel,
-                                bool ready_to_send)
-      RTC_RUN_ON(signaling_thread());
+                                bool ready_to_send,
+                                int id) RTC_RUN_ON(signaling_thread());
 
   // Accepts a `StreamId` which may be pre-negotiated or unassigned. For
   // pre-negotiated sids, attempts to reserve the sid in the allocation pool,

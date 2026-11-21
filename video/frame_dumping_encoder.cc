@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
@@ -43,7 +44,7 @@ class FrameDumpingEncoder : public VideoEncoder, public EncodedImageCallback {
                       int64_t origin_time_micros,
                       std::string output_directory)
       : wrapped_(std::move(wrapped)),
-        output_directory_(output_directory),
+        output_directory_(std::move(output_directory)),
         origin_time_micros_(origin_time_micros) {}
 
   ~FrameDumpingEncoder() override {
@@ -73,6 +74,12 @@ class FrameDumpingEncoder : public VideoEncoder, public EncodedImageCallback {
   }
   void SetRates(const RateControlParameters& parameters) override {
     wrapped_->SetRates(parameters);
+  }
+  void SetComplexity(
+      std::span<const VideoCodecComplexity> complexity_by_spatial_layer,
+      ComplexityControlMode complexity_control_mode) override {
+    wrapped_->SetComplexity(complexity_by_spatial_layer,
+                            complexity_control_mode);
   }
   void OnPacketLossRateUpdate(float packet_loss_rate) override {
     wrapped_->OnPacketLossRateUpdate(packet_loss_rate);

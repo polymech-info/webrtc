@@ -15,6 +15,7 @@
 #include <memory>
 #include <numeric>
 #include <optional>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
@@ -171,6 +172,10 @@ class VideoEncoderSoftwareFallbackWrapper final : public VideoEncoder {
 
   void SetRates(const RateControlParameters& parameters) override;
 
+  void SetComplexity(
+      std::span<const VideoCodecComplexity> complexity_by_spatial_layer,
+      ComplexityControlMode complexity_control_mode) override;
+
   EncoderInfo GetEncoderInfo() const override;
 
  private:
@@ -210,6 +215,9 @@ class VideoEncoderSoftwareFallbackWrapper final : public VideoEncoder {
   std::optional<float> packet_loss_;
   std::optional<int64_t> rtt_;
   std::optional<LossNotification> loss_notification_;
+  std::optional<std::vector<VideoCodecComplexity>> complexity_by_spatial_layer_;
+  ComplexityControlMode complexity_control_mode_ =
+      ComplexityControlMode::kConstant;
 
   enum class EncoderState {
     kUninitialized,
@@ -266,6 +274,10 @@ void VideoEncoderSoftwareFallbackWrapper::PrimeEncoder(
 
   if (loss_notification_.has_value()) {
     encoder->OnLossNotification(loss_notification_.value());
+  }
+  if (complexity_by_spatial_layer_.has_value()) {
+    encoder->SetComplexity(*complexity_by_spatial_layer_,
+                           complexity_control_mode_);
   }
 }
 
@@ -439,6 +451,16 @@ void VideoEncoderSoftwareFallbackWrapper::SetRates(
   return current_encoder()->SetRates(parameters);
 }
 
+void VideoEncoderSoftwareFallbackWrapper::SetComplexity(
+    std::span<const VideoCodecComplexity> complexity_by_spatial_layer,
+    ComplexityControlMode complexity_control_mode) {
+  complexity_by_spatial_layer_.emplace(complexity_by_spatial_layer.begin(),
+                                       complexity_by_spatial_layer.end());
+  complexity_control_mode_ = complexity_control_mode;
+  current_encoder()->SetComplexity(complexity_by_spatial_layer,
+                                   complexity_control_mode);
+}
+
 void VideoEncoderSoftwareFallbackWrapper::OnPacketLossRateUpdate(
     float packet_loss_rate) {
   packet_loss_ = packet_loss_rate;
@@ -470,6 +492,10 @@ VideoEncoder::EncoderInfo VideoEncoderSoftwareFallbackWrapper::GetEncoderInfo()
   info.apply_alignment_to_all_simulcast_layers =
       fallback_encoder_info.apply_alignment_to_all_simulcast_layers ||
       default_encoder_info.apply_alignment_to_all_simulcast_layers;
+  // The fallback encoder's limit is the one that always holds: frames the
+  // default encoder rejects are routed to it, and the default encoder's own
+  // limit only applies while it is active.
+  info.max_pixels_per_frame = fallback_encoder_info.max_pixels_per_frame;
 
   if (fallback_params_ && fallback_params_->vp8_specific_resolution_switch) {
     info.scaling_settings.min_pixels_per_frame = fallback_params_->min_pixels;

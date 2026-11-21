@@ -22,7 +22,6 @@
 #include "api/audio_codecs/audio_format.h"
 #include "api/audio_codecs/builtin_audio_decoder_factory.h"
 #include "api/audio_codecs/builtin_audio_encoder_factory.h"
-#include "api/environment/environment_factory.h"
 #include "api/neteq/default_neteq_factory.h"
 #include "api/neteq/neteq.h"
 #include "api/rtp_headers.h"
@@ -32,6 +31,7 @@
 #include "modules/audio_coding/include/audio_coding_module_typedefs.h"
 #include "rtc_base/checks.h"
 #include "rtc_base/strings/string_builder.h"
+#include "test/create_test_environment.h"
 #include "test/gtest.h"
 #include "test/testsupport/file_utils.h"
 
@@ -116,7 +116,7 @@ void TestPack::reset_payload_size() {
 }
 
 TestAllCodecs::TestAllCodecs()
-    : env_(CreateEnvironment()),
+    : env_(CreateTestEnvironment()),
       acm_a_(AudioCodingModule::Create()),
       neteq_(DefaultNetEqFactory().Create(env_,
                                           NetEq::Config(),
@@ -180,7 +180,7 @@ void TestAllCodecs::Perform() {
   Run(channel_a_to_b_);
   RegisterSendCodec(codec_g722, 16000, 64000, 960, 0);
   Run(channel_a_to_b_);
-  outfile_b_.Close();
+  CloseOutFile();
 #endif
   test_count_++;
   OpenOutFile(test_count_);
@@ -193,7 +193,7 @@ void TestAllCodecs::Perform() {
   Run(channel_a_to_b_);
   RegisterSendCodec(codec_l16, 8000, 128000, 320, 0);
   Run(channel_a_to_b_);
-  outfile_b_.Close();
+  CloseOutFile();
 
   test_count_++;
   OpenOutFile(test_count_);
@@ -205,7 +205,7 @@ void TestAllCodecs::Perform() {
   Run(channel_a_to_b_);
   RegisterSendCodec(codec_l16, 16000, 256000, 640, 0);
   Run(channel_a_to_b_);
-  outfile_b_.Close();
+  CloseOutFile();
 
   test_count_++;
   OpenOutFile(test_count_);
@@ -213,7 +213,7 @@ void TestAllCodecs::Perform() {
   Run(channel_a_to_b_);
   RegisterSendCodec(codec_l16, 32000, 512000, 640, 0);
   Run(channel_a_to_b_);
-  outfile_b_.Close();
+  CloseOutFile();
 
   test_count_++;
   OpenOutFile(test_count_);
@@ -244,7 +244,7 @@ void TestAllCodecs::Perform() {
   Run(channel_a_to_b_);
   RegisterSendCodec(codec_pcmu, 8000, 64000, 480, 0);
   Run(channel_a_to_b_);
-  outfile_b_.Close();
+  CloseOutFile();
 #ifdef WEBRTC_CODEC_OPUS
   test_count_++;
   OpenOutFile(test_count_);
@@ -263,7 +263,7 @@ void TestAllCodecs::Perform() {
   Run(channel_a_to_b_);
   RegisterSendCodec(codec_opus, 48000, 500000, 480 * 2, kVariableSize);
   Run(channel_a_to_b_);
-  outfile_b_.Close();
+  CloseOutFile();
 #endif
 }
 
@@ -378,13 +378,15 @@ void TestAllCodecs::Run(TestPack* channel) {
 }
 
 void TestAllCodecs::OpenOutFile(int test_number) {
-  std::string filename = test::OutputPath();
-  StringBuilder test_number_str;
-  test_number_str << test_number;
-  filename += "testallcodecs_out_";
-  filename += test_number_str.str();
-  filename += ".pcm";
-  outfile_b_.Open(filename, 32000, "wb");
+  StringBuilder filename;
+  filename << "testallcodecs_out_" << test_number << ".pcm";
+  outfile_b_name_ = test::TempFilename(test::OutputPath(), filename.str());
+  outfile_b_.Open(outfile_b_name_, 32000, "wb");
+}
+
+void TestAllCodecs::CloseOutFile() {
+  outfile_b_.Close();
+  EXPECT_TRUE(test::RemoveFile(outfile_b_name_));
 }
 
 }  // namespace webrtc

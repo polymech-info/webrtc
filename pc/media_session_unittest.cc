@@ -752,15 +752,11 @@ class MediaSessionDescriptionFactoryTest : public testing::Test {
         codec_lookup_helper_1_(env_.field_trials()),
         codec_lookup_helper_2_(env_.field_trials()),
         f1_(env_,
-            nullptr,
-            false,
             &ssrc_generator1,
             &tdf1_,
             &sctp_factory_1_,
             &codec_lookup_helper_1_),
         f2_(env_,
-            nullptr,
-            false,
             &ssrc_generator2,
             &tdf2_,
             &sctp_factory_2_,
@@ -1036,6 +1032,40 @@ TEST_F(MediaSessionDescriptionFactoryTest, TestCreateAudioOffer) {
   EXPECT_EQ(acd->bandwidth(), kAutoBandwidth);  // default bandwidth (auto)
   EXPECT_TRUE(acd->rtcp_mux());                 // rtcp-mux defaults on
   EXPECT_EQ(acd->protocol(), kMediaProtocolDtlsSavpf);
+}
+
+// With the RRTR field trial enabled (default), an offer enables non-sender
+// RTT on the negotiated description. Serialization to a=rtcp-xr:rcvr-rtt is
+// covered in webrtc_sdp_unittest.
+TEST_F(MediaSessionDescriptionFactoryTest,
+       CreateAudioOfferEnablesReceiveNonSenderRtt) {
+  std::unique_ptr<SessionDescription> offer =
+      f1_.CreateOfferOrError(CreateAudioMediaSession(), nullptr).MoveValue();
+  ASSERT_TRUE(offer.get());
+  const MediaContentDescription* acd =
+      GetFirstAudioContentDescription(offer.get());
+  ASSERT_TRUE(acd);
+  EXPECT_TRUE(acd->receive_non_sender_rtt());
+}
+
+class MediaSessionDescriptionFactoryRcvrRttDisabledTest
+    : public MediaSessionDescriptionFactoryTest {
+ protected:
+  MediaSessionDescriptionFactoryRcvrRttDisabledTest()
+      : MediaSessionDescriptionFactoryTest(
+            "WebRTC-RtcpXrReceiverReferenceTime/Disabled/") {}
+};
+
+// With the field trial disabled, the offer must not enable non-sender RTT.
+TEST_F(MediaSessionDescriptionFactoryRcvrRttDisabledTest,
+       CreateAudioOfferDoesNotEnableReceiveNonSenderRtt) {
+  std::unique_ptr<SessionDescription> offer =
+      f1_.CreateOfferOrError(CreateAudioMediaSession(), nullptr).MoveValue();
+  ASSERT_TRUE(offer.get());
+  const MediaContentDescription* acd =
+      GetFirstAudioContentDescription(offer.get());
+  ASSERT_TRUE(acd);
+  EXPECT_FALSE(acd->receive_non_sender_rtt());
 }
 
 // Create an offer with just Opus and RED.
@@ -3664,8 +3694,9 @@ TEST_F(MediaSessionDescriptionFactoryTest,
   int new_h264_pl_type = updated_vcd->codecs()[0].id;
   EXPECT_NE(used_pl_type, new_h264_pl_type);
   Codec rtx = updated_vcd->codecs()[1];
-  int pt_referenced_by_rtx =
-      FromString<int>(rtx.params[kCodecParamAssociatedPayloadType]);
+  int pt_referenced_by_rtx;
+  EXPECT_TRUE(
+      rtx.GetParam(kCodecParamAssociatedPayloadType, &pt_referenced_by_rtx));
   EXPECT_EQ(new_h264_pl_type, pt_referenced_by_rtx);
 }
 
@@ -4706,7 +4737,7 @@ INSTANTIATE_TEST_SUITE_P(Sframe,
                          SframeMediaTypeTest,
                          ::testing::Values(MediaType::AUDIO, MediaType::VIDEO),
                          [](const ::testing::TestParamInfo<MediaType>& info) {
-                           return MediaTypeToString(info.param);
+                           return std::string(MediaTypeToString(info.param));
                          });
 
 TEST_F(MediaSessionDescriptionFactoryTest,
@@ -5111,11 +5142,11 @@ TEST_F(MediaSessionDescriptionFactoryTest,
   // Create two H264 codecs with the same profile level ID and different
   // packetization modes.
   Codec h264_pm0 = CreateVideoCodec(96, "H264");
-  h264_pm0.params[kH264FmtpProfileLevelId] = "42c01f";
-  h264_pm0.params[kH264FmtpPacketizationMode] = "0";
+  h264_pm0.SetParam(kH264FmtpProfileLevelId, "42c01f");
+  h264_pm0.SetParam(kH264FmtpPacketizationMode, "0");
   Codec h264_pm1 = CreateVideoCodec(97, "H264");
-  h264_pm1.params[kH264FmtpProfileLevelId] = "42c01f";
-  h264_pm1.params[kH264FmtpPacketizationMode] = "1";
+  h264_pm1.SetParam(kH264FmtpProfileLevelId, "42c01f");
+  h264_pm1.SetParam(kH264FmtpPacketizationMode, "1");
 
   // Offerer will send both codecs, answerer should choose the one with matching
   // packetization mode (and not the first one it sees).
@@ -5153,15 +5184,11 @@ class MediaProtocolTest : public testing::TestWithParam<const char*> {
         codec_lookup_helper_1_(env_.field_trials()),
         codec_lookup_helper_2_(env_.field_trials()),
         f1_(env_,
-            nullptr,
-            false,
             &ssrc_generator1,
             &tdf1_,
             &sctp_factory_1_,
             &codec_lookup_helper_1_),
         f2_(env_,
-            nullptr,
-            false,
             &ssrc_generator2,
             &tdf2_,
             &sctp_factory_2_,
@@ -5230,8 +5257,8 @@ void TestAudioCodecsOffer(RtpTransceiverDirection direction) {
   UniqueRandomIdGenerator ssrc_generator;
   CodecLookupHelperForTesting codec_lookup_helper(env.field_trials());
   FakeSctpTransportFactory sctpf;
-  MediaSessionDescriptionFactory sf(env, nullptr, false, &ssrc_generator, &tdf,
-                                    &sctpf, &codec_lookup_helper);
+  MediaSessionDescriptionFactory sf(env, &ssrc_generator, &tdf, &sctpf,
+                                    &codec_lookup_helper);
   const std::vector<Codec> send_codecs(kAudioCodecs1.begin(),
                                        kAudioCodecs1.end());
   const std::vector<Codec> recv_codecs(kAudioCodecs2.begin(),
@@ -5344,13 +5371,13 @@ void TestAudioCodecsAnswer(RtpTransceiverDirection offer_direction,
       std::unique_ptr<SSLIdentity>(new FakeSSLIdentity("answer_id"))));
   UniqueRandomIdGenerator ssrc_generator1, ssrc_generator2;
   CodecLookupHelperForTesting offer_codec_lookup_helper(env.field_trials());
-  MediaSessionDescriptionFactory offer_factory(
-      env, nullptr, false, &ssrc_generator1, &offer_tdf, &offer_sctpf,
-      &offer_codec_lookup_helper);
+  MediaSessionDescriptionFactory offer_factory(env, &ssrc_generator1,
+                                               &offer_tdf, &offer_sctpf,
+                                               &offer_codec_lookup_helper);
   CodecLookupHelperForTesting answer_codec_lookup_helper(env.field_trials());
-  MediaSessionDescriptionFactory answer_factory(
-      env, nullptr, false, &ssrc_generator2, &answer_tdf, &answer_sctpf,
-      &answer_codec_lookup_helper);
+  MediaSessionDescriptionFactory answer_factory(env, &ssrc_generator2,
+                                                &answer_tdf, &answer_sctpf,
+                                                &answer_codec_lookup_helper);
 
   offer_codec_lookup_helper.SetAudioCodecs(
       VectorFromIndices(kOfferAnswerCodecs, kOfferSendCodecs),
@@ -5496,15 +5523,11 @@ class VideoCodecsOfferH265LevelIdTest : public testing::Test {
         tdf_offerer_(env_.field_trials()),
         tdf_answerer_(env_.field_trials()),
         sf_offerer_(env_,
-                    nullptr,
-                    false,
                     &ssrc_generator_offerer_,
                     &tdf_offerer_,
                     &sctpf_offerer_,
                     &codec_lookup_helper_offerer_),
         sf_answerer_(env_,
-                     nullptr,
-                     false,
                      &ssrc_generator_answerer_,
                      &tdf_answerer_,
                      &sctpf_answerer_,

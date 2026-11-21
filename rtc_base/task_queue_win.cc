@@ -69,7 +69,6 @@ ThreadPriority TaskQueuePriorityToThreadPriority(
     case TaskQueueFactory::Priority::kAudio:
       return ThreadPriority::kAudio;
   }
-  return ThreadPriority::kNormal;
 }
 
 Timestamp CurrentTime() {

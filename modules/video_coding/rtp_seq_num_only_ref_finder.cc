@@ -12,8 +12,10 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <utility>
 
+#include "api/field_trials_view.h"
 #include "modules/rtp_rtcp/source/frame_object.h"
 #include "modules/video_coding/rtp_frame_reference_finder.h"
 #include "rtc_base/checks.h"
@@ -22,6 +24,13 @@
 #include "rtc_base/numerics/sequence_number_util.h"
 
 namespace webrtc {
+
+RtpSeqNumOnlyRefFinder::RtpSeqNumOnlyRefFinder(
+    const FieldTrialsView* field_trials)
+    : set_spatial_index_to_zero_by_default_(
+          field_trials != nullptr &&
+          field_trials->IsEnabled(
+              "WebRTC-Video-SeqNumOnlyRefFinderSpatialIndexKillSwitch")) {}
 
 RtpFrameReferenceFinder::ReturnVector RtpSeqNumOnlyRefFinder::ManageFrame(
     std::unique_ptr<RtpFrameObject> frame) {
@@ -48,6 +57,24 @@ RtpFrameReferenceFinder::ReturnVector RtpSeqNumOnlyRefFinder::ManageFrame(
 RtpSeqNumOnlyRefFinder::FrameDecision
 RtpSeqNumOnlyRefFinder::ManageFrameInternal(RtpFrameObject* frame) {
   if (frame->IsKey()) {
+    // After a large sequence-number jump/wrap (>= half the 16-bit space), a
+    // stale pre-jump GoP appears "ahead" of this keyframe and shadows
+    // upper_bound lookups, causing delta frames to be dropped ("has no GoP")
+    // for 60-150s. Remove such stale GoPs. The distance threshold ensures we
+    // only remove GoPs that are *far* ahead (a stale pre-jump GoP is
+    // ~22000-32768 sequence numbers ahead), while protecting a legitimately
+    // reordered near-future keyframe (at most a few hundred ahead) from being
+    // erased. issues.webrtc.org/516639936.
+    constexpr uint16_t kMaxGopReorderingDistance = 0x2000;  // 8192
+    for (auto it = last_seq_num_gop_.begin(); it != last_seq_num_gop_.end();) {
+      if (AheadOf<uint16_t>(it->first, frame->last_seq_num()) &&
+          ForwardDiff<uint16_t>(frame->last_seq_num(), it->first) >
+              kMaxGopReorderingDistance) {
+        it = last_seq_num_gop_.erase(it);
+      } else {
+        ++it;
+      }
+    }
     last_seq_num_gop_.insert(std::make_pair(
         frame->last_seq_num(),
         std::make_pair(frame->last_seq_num(), frame->last_seq_num())));
@@ -101,7 +128,8 @@ RtpSeqNumOnlyRefFinder::ManageFrameInternal(RtpFrameObject* frame) {
   }
 
   UpdateLastPictureIdWithPadding(frame->Id());
-  frame->SetSpatialIndex(0);
+  frame->SetSpatialIndex(
+      set_spatial_index_to_zero_by_default_ ? std::optional(0) : std::nullopt);
   frame->SetId(rtp_seq_num_unwrapper_.Unwrap(frame->Id()));
   return kHandOff;
 }

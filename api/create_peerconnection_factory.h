@@ -36,7 +36,6 @@ class AudioFrameProcessor;
 RTC_EXPORT scoped_refptr<PeerConnectionFactoryInterface>
 CreatePeerConnectionFactory(
     Thread* network_thread,
-    Thread* worker_thread,
     Thread* signaling_thread,
     scoped_refptr<AudioDeviceModule> default_adm,
     scoped_refptr<AudioEncoderFactory> audio_encoder_factory,

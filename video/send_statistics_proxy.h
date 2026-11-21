@@ -21,7 +21,7 @@
 #include <string>
 #include <vector>
 
-#include "api/field_trials_view.h"
+#include "api/environment/environment.h"
 #include "api/units/time_delta.h"
 #include "api/units/timestamp.h"
 #include "api/video/video_adaptation_counters.h"
@@ -63,10 +63,9 @@ class SendStatisticsProxy : public VideoStreamEncoderObserver,
   static const int kMinRequiredMetricsSamples = 200;
   static const int kMinRequiredPsnrSamples = 5;
 
-  SendStatisticsProxy(Clock* clock,
+  SendStatisticsProxy(const Environment& env,
                       const VideoSendStream::Config& config,
-                      VideoEncoderConfig::ContentType content_type,
-                      const FieldTrialsView& field_trials);
+                      VideoEncoderConfig::ContentType content_type);
   ~SendStatisticsProxy() override;
 
   virtual VideoSendStream::Stats GetStats();
@@ -321,7 +320,7 @@ class SendStatisticsProxy : public VideoStreamEncoderObserver,
                                    int simulcast_index)
       RTC_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
 
-  Clock* const clock_;
+  const Environment env_;
   const std::string payload_name_;
   const RtpConfig rtp_config_;
   const std::optional<int> fallback_max_pixels_;
@@ -335,6 +334,7 @@ class SendStatisticsProxy : public VideoStreamEncoderObserver,
       RTC_GUARDED_BY(mutex_);
   RateTracker media_byte_rate_tracker_ RTC_GUARDED_BY(mutex_);
   RateTracker encoded_frame_rate_tracker_ RTC_GUARDED_BY(mutex_);
+  RateTracker dropped_due_to_bandwidth_rate_tracker_ RTC_GUARDED_BY(mutex_);
   // Trackers mapped by ssrc.
   std::map<uint32_t, Trackers> trackers_ RTC_GUARDED_BY(mutex_);
 

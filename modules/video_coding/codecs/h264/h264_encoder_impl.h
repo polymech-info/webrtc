@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <span>
 #include <vector>
 
 #include "absl/container/inlined_vector.h"
@@ -39,7 +40,6 @@
 #include "modules/video_coding/codecs/h264/include/h264_globals.h"
 #include "modules/video_coding/svc/scalable_video_controller.h"
 #include "modules/video_coding/utility/frame_sampler.h"
-#include "rtc_base/experiments/psnr_experiment.h"
 #include "third_party/openh264/src/codec/api/wels/codec_app_def.h"
 
 #if defined(WEBRTC_WIN) && !defined(__clang__)
@@ -86,6 +86,9 @@ class H264EncoderImpl : public VideoEncoder {
   int32_t RegisterEncodeCompleteCallback(
       EncodedImageCallback* callback) override;
   void SetRates(const RateControlParameters& parameters) override;
+  void SetComplexity(
+      std::span<const VideoCodecComplexity> complexity_by_spatial_layer,
+      ComplexityControlMode complexity_control_mode) override;
 
   // The result of encoding - an EncodedImage and CodecSpecificInfo - are
   // passed to the encode complete callback.
@@ -98,6 +101,8 @@ class H264EncoderImpl : public VideoEncoder {
   H264PacketizationMode PacketizationModeForTesting() const {
     return packetization_mode_;
   }
+  std::optional<ECOMPLEXITY_MODE> ComplexityModeForTesting(
+      size_t stream_idx = 0) const;
 
  private:
   SEncParamExt CreateEncoderParams(size_t i) const;
@@ -130,8 +135,6 @@ class H264EncoderImpl : public VideoEncoder {
   std::vector<uint8_t> tl0sync_limit_;
 
   // Determine whether the frame should be sampled for PSNR.
-  // TODO(webrtc:388070060): Remove after rollout.
-  const PsnrExperiment psnr_experiment_;
   FrameSampler psnr_frame_sampler_;
 };
 

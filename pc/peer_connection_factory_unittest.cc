@@ -26,11 +26,9 @@
 #include "api/create_modular_peer_connection_factory.h"
 #include "api/create_peerconnection_factory.h"
 #include "api/data_channel_interface.h"
-#include "api/enable_media.h"
 #include "api/enable_media_with_defaults.h"
 #include "api/environment/environment.h"
 #include "api/environment/environment_factory.h"
-#include "api/field_trials.h"
 #include "api/field_trials_view.h"
 #include "api/jsep.h"
 #include "api/make_ref_counted.h"
@@ -61,6 +59,8 @@
 #include "p2p/test/fake_port_allocator.h"
 #include "pc/connection_context.h"
 #include "pc/test/fake_audio_capture_module.h"
+#include "pc/test/fake_rtc_certificate_generator.h"
+#include "pc/test/fake_video_track_renderer.h"
 #include "pc/test/fake_video_track_source.h"
 #include "rtc_base/event.h"
 #include "rtc_base/internal/default_socket_server.h"
@@ -76,12 +76,6 @@
 #include "test/run_loop.h"
 #include "test/testsupport/file_utils.h"
 
-#ifdef WEBRTC_ANDROID
-#include "pc/test/android_test_initializer.h"
-#endif
-#include "pc/test/fake_rtc_certificate_generator.h"
-#include "pc/test/fake_video_track_renderer.h"
-
 namespace webrtc {
 namespace {
 
@@ -90,7 +84,6 @@ using test::MockAudioProcessingBuilder;
 using ::testing::_;
 using ::testing::A;
 using ::testing::AtLeast;
-using ::testing::InvokeWithoutArgs;
 using ::testing::NiceMock;
 using ::testing::NotNull;
 using ::testing::Return;
@@ -153,14 +146,11 @@ class PeerConnectionFactoryTest : public ::testing::Test {
 
  private:
   void SetUp() override {
-#ifdef WEBRTC_ANDROID
-    InitializeAndroidObjects();
-#endif
     // Use fake audio device module since we're only testing the interface
     // level, and using a real one could make tests flaky e.g. when run in
     // parallel.
     factory_ = CreatePeerConnectionFactory(
-        Thread::Current(), Thread::Current(), Thread::Current(),
+        Thread::Current(), Thread::Current(),
         scoped_refptr<AudioDeviceModule>(FakeAudioCaptureModule::Create()),
         CreateBuiltinAudioEncoderFactory(), CreateBuiltinAudioDecoderFactory(),
         std::make_unique<VideoEncoderFactoryTemplate<
@@ -279,36 +269,6 @@ class PeerConnectionFactoryTest : public ::testing::Test {
   FakePortAllocator* raw_port_allocator_;
 };
 
-// Since there is no public PeerConnectionFactory API to control RTX usage, need
-// to reconstruct factory with our own ConnectionContext.
-scoped_refptr<PeerConnectionFactoryInterface>
-CreatePeerConnectionFactoryWithRtxDisabled() {
-  PeerConnectionFactoryDependencies pcf_dependencies;
-  pcf_dependencies.signaling_thread = Thread::Current();
-  pcf_dependencies.worker_thread = Thread::Current();
-  pcf_dependencies.network_thread = Thread::Current();
-
-  pcf_dependencies.adm = FakeAudioCaptureModule::Create();
-  pcf_dependencies.audio_encoder_factory = CreateBuiltinAudioEncoderFactory();
-  pcf_dependencies.audio_decoder_factory = CreateBuiltinAudioDecoderFactory();
-  pcf_dependencies.video_encoder_factory =
-      std::make_unique<VideoEncoderFactoryTemplate<
-          LibvpxVp8EncoderTemplateAdapter, LibvpxVp9EncoderTemplateAdapter,
-          OpenH264EncoderTemplateAdapter, LibaomAv1EncoderTemplateAdapter>>();
-  pcf_dependencies.video_decoder_factory =
-      std::make_unique<VideoDecoderFactoryTemplate<
-          LibvpxVp8DecoderTemplateAdapter, LibvpxVp9DecoderTemplateAdapter,
-          OpenH264DecoderTemplateAdapter, Dav1dDecoderTemplateAdapter>>(),
-  EnableMedia(pcf_dependencies);
-
-  Environment env = CreateTestEnvironment();
-  scoped_refptr<ConnectionContext> context =
-      ConnectionContext::Create(env, &pcf_dependencies);
-  context->set_use_rtx(false);
-  return make_ref_counted<PeerConnectionFactory>(env, context,
-                                                 &pcf_dependencies);
-}
-
 // Verify creation of PeerConnection using internal ADM, video factory and
 // internal libjingle threads.
 // TODO(henrika): disabling this test since relying on real audio can result in
@@ -316,15 +276,10 @@ CreatePeerConnectionFactoryWithRtxDisabled() {
 // for a PeerConnectionFactory unit test.
 // See https://bugs.chromium.org/p/webrtc/issues/detail?id=7806 for details.
 TEST(PeerConnectionFactoryTestInternal, DISABLED_CreatePCUsingInternalModules) {
-#ifdef WEBRTC_ANDROID
-  InitializeAndroidObjects();
-#endif
-
   scoped_refptr<PeerConnectionFactoryInterface> factory(
       CreatePeerConnectionFactory(
-          nullptr /* network_thread */, nullptr /* worker_thread */,
-          nullptr /* signaling_thread */, nullptr /* default_adm */,
-          CreateBuiltinAudioEncoderFactory(),
+          nullptr /* network_thread */, nullptr /* signaling_thread */,
+          nullptr /* default_adm */, CreateBuiltinAudioEncoderFactory(),
           CreateBuiltinAudioDecoderFactory(),
           nullptr /* video_encoder_factory */,
           nullptr /* video_decoder_factory */, nullptr /* audio_mixer */,
@@ -380,16 +335,6 @@ TEST_F(PeerConnectionFactoryTest, CheckRtpSenderRtxEnabledCapabilities) {
   EXPECT_TRUE(it != video_capabilities.codecs.end());
 }
 
-TEST(PeerConnectionFactoryTestInternal, CheckRtpSenderRtxDisabledCapabilities) {
-  auto factory = CreatePeerConnectionFactoryWithRtxDisabled();
-  RtpCapabilities video_capabilities =
-      factory->GetRtpSenderCapabilities(MediaType::VIDEO);
-  const auto it = std::find_if(
-      video_capabilities.codecs.begin(), video_capabilities.codecs.end(),
-      [](const auto& c) { return c.name == kRtxCodecName; });
-  EXPECT_TRUE(it == video_capabilities.codecs.end());
-}
-
 TEST_F(PeerConnectionFactoryTest, CheckRtpSenderDataCapabilities) {
   RtpCapabilities data_capabilities =
       factory_->GetRtpSenderCapabilities(MediaType::DATA);
@@ -430,17 +375,6 @@ TEST_F(PeerConnectionFactoryTest, CheckRtpReceiverRtxEnabledCapabilities) {
       video_capabilities.codecs.begin(), video_capabilities.codecs.end(),
       [](const auto& c) { return c.name == kRtxCodecName; });
   EXPECT_TRUE(it != video_capabilities.codecs.end());
-}
-
-TEST(PeerConnectionFactoryTestInternal,
-     CheckRtpReceiverRtxDisabledCapabilities) {
-  auto factory = CreatePeerConnectionFactoryWithRtxDisabled();
-  RtpCapabilities video_capabilities =
-      factory->GetRtpReceiverCapabilities(MediaType::VIDEO);
-  const auto it = std::find_if(
-      video_capabilities.codecs.begin(), video_capabilities.codecs.end(),
-      [](const auto& c) { return c.name == kRtxCodecName; });
-  EXPECT_TRUE(it == video_capabilities.codecs.end());
 }
 
 TEST_F(PeerConnectionFactoryTest, CheckRtpReceiverDataCapabilities) {
@@ -679,7 +613,7 @@ TEST_F(PeerConnectionFactoryTest, LocalRendering) {
 
 TEST(PeerConnectionFactoryDependenciesTest,
      CanInjectFieldTrialsWithEnvironment) {
-  std::unique_ptr<FieldTrialsView> field_trials = FieldTrials::Create("");
+  std::unique_ptr<FieldTrialsView> field_trials = CreateTestFieldTrialsPtr("");
   ASSERT_THAT(field_trials, NotNull());
   FieldTrialsView* raw_field_trials = field_trials.get();
 
@@ -700,10 +634,11 @@ TEST(PeerConnectionFactoryDependenciesTest, UsesNetworkManager) {
   Event called;
   EXPECT_CALL(*mock_network_manager, StartUpdating())
       .Times(AtLeast(1))
-      .WillRepeatedly(InvokeWithoutArgs([&] { called.Set(); }));
+      .WillRepeatedly([&] { called.Set(); });
 
   PeerConnectionFactoryDependencies pcf_dependencies;
   pcf_dependencies.network_manager = std::move(mock_network_manager);
+  pcf_dependencies.env = CreateTestEnvironment();
 
   scoped_refptr<PeerConnectionFactoryInterface> pcf =
       CreateModularPeerConnectionFactory(std::move(pcf_dependencies));
@@ -733,6 +668,7 @@ TEST(PeerConnectionFactoryDependenciesTest, UsesPacketSocketFactory) {
 
   PeerConnectionFactoryDependencies pcf_dependencies;
   pcf_dependencies.packet_socket_factory = std::move(mock_socket_factory);
+  pcf_dependencies.env = CreateTestEnvironment();
 
   scoped_refptr<PeerConnectionFactoryInterface> pcf =
       CreateModularPeerConnectionFactory(std::move(pcf_dependencies));
@@ -766,6 +702,7 @@ TEST(PeerConnectionFactoryDependenciesTest,
   PeerConnectionFactoryDependencies pcf_dependencies;
   pcf_dependencies.adm = FakeAudioCaptureModule::Create();
   pcf_dependencies.audio_processing_builder = std::move(ap_factory);
+  pcf_dependencies.env = CreateTestEnvironment();
   EnableMediaWithDefaults(pcf_dependencies);
 
   scoped_refptr<PeerConnectionFactoryInterface> pcf =
@@ -785,8 +722,8 @@ TEST(PeerConnectionFactoryDependenciesTest, RepeatMediaEngineInitialization) {
   PeerConnectionFactoryDependencies pcf_dependencies;
   pcf_dependencies.adm = adm;
   pcf_dependencies.signaling_thread = Thread::Current();
-  pcf_dependencies.worker_thread = Thread::Current();
   pcf_dependencies.network_thread = Thread::Current();
+  pcf_dependencies.env = CreateTestEnvironment();
   EnableMediaWithDefaults(pcf_dependencies);
 
   scoped_refptr<PeerConnectionFactoryInterface> pcf =
@@ -823,8 +760,8 @@ TEST(PeerConnectionFactoryDependenciesTest,
   pcf_dependencies.adm = FakeAudioCaptureModule::Create();
   pcf_dependencies.audio_processing_builder = std::move(ap_factory);
   pcf_dependencies.signaling_thread = Thread::Current();
-  pcf_dependencies.worker_thread = Thread::Current();
   pcf_dependencies.network_thread = Thread::Current();
+  pcf_dependencies.env = CreateTestEnvironment();
   EnableMediaWithDefaults(pcf_dependencies);
 
   scoped_refptr<PeerConnectionFactoryInterface> pcf =
@@ -856,6 +793,30 @@ TEST(PeerConnectionFactoryDependenciesTest,
   pcf = nullptr;
 }
 #endif
+
+TEST(ConnectionContextTest,
+     WorkerThreadDefaultsToNetworkThreadWhenWorkerThreadNotSet) {
+  Environment env = CreateTestEnvironment();
+  PeerConnectionFactoryDependencies dependencies;
+  dependencies.signaling_thread = Thread::Current();
+  auto context = ConnectionContext::Create(env, &dependencies);
+  ASSERT_THAT(context, NotNull());
+  EXPECT_THAT(context->network_thread(), NotNull());
+  EXPECT_EQ(context->worker_thread(), context->network_thread());
+}
+
+TEST(ConnectionContextTest, SuppliedNetworkThreadIsUsedAsWorkerThread) {
+  Environment env = CreateTestEnvironment();
+  std::unique_ptr<Thread> network_thread = Thread::CreateWithSocketServer();
+  network_thread->Start();
+  PeerConnectionFactoryDependencies dependencies;
+  dependencies.signaling_thread = Thread::Current();
+  dependencies.network_thread = network_thread.get();
+  auto context = ConnectionContext::Create(env, &dependencies);
+  ASSERT_THAT(context, NotNull());
+  EXPECT_EQ(context->network_thread(), network_thread.get());
+  EXPECT_EQ(context->worker_thread(), network_thread.get());
+}
 
 }  // namespace
 }  // namespace webrtc

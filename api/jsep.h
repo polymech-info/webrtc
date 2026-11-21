@@ -29,6 +29,7 @@
 #include <vector>
 
 #include "absl/base/nullability.h"
+#include "absl/functional/any_invocable.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/string_view.h"
 #include "api/candidate.h"
@@ -147,14 +148,8 @@ class IceCandidateCollection final {
   IceCandidateCollection(const IceCandidateCollection&) = delete;
   IceCandidateCollection& operator=(const IceCandidateCollection&) = delete;
 
-  size_t count() const {
-    RTC_DCHECK_RUN_ON(&sequence_checker_);
-    return candidates_.size();
-  }
-  bool empty() const {
-    RTC_DCHECK_RUN_ON(&sequence_checker_);
-    return candidates_.empty();
-  }
+  size_t count() const { return candidates_.size(); }
+  bool empty() const { return candidates_.empty(); }
   const IceCandidate* at(size_t index) const;
 
   // Adds and takes ownership of the IceCandidate.
@@ -178,12 +173,13 @@ class IceCandidateCollection final {
   bool HasCandidate(const IceCandidate* candidate) const;
 
   IceCandidateCollection Clone() const;
-  void RelinquishThreadOwnership();
+
+  // TODO(tommi): Remove once downstream code no longer calls this.
+  [[deprecated("No-op, IceCandidateCollection isn't bound to a thread.")]]
+  void RelinquishThreadOwnership() {}
 
  private:
-  RTC_NO_UNIQUE_ADDRESS SequenceChecker sequence_checker_;
-  std::vector<std::unique_ptr<IceCandidate>> candidates_
-      RTC_GUARDED_BY(sequence_checker_);
+  std::vector<std::unique_ptr<IceCandidate>> candidates_;
 };
 
 // Enum that describes the type of the SessionDescriptionInterface.
@@ -227,6 +223,10 @@ struct EncodingOptions {
 
 class RTC_EXPORT SessionDescriptionInterface final {
  public:
+  // If `candidates` is not empty, it must contain one collection per media
+  // section of `description`. The connection address of each media section
+  // that has candidates is updated based on those candidates, the same way
+  // AddCandidate() does.
   static std::unique_ptr<SessionDescriptionInterface> Create(
       SdpType type,
       std::unique_ptr<SessionDescription> description,
@@ -394,6 +394,14 @@ class RTC_EXPORT CreateSessionDescriptionObserver : public RefCountInterface {
   // is removed; its functionality was the same as passing
   // error.message.
   virtual void OnFailure(RTCError error) = 0;
+
+  // Called after OnSuccess() or OnFailure(). An embedding that delivers the
+  // observer result asynchronously may defer invoking `callback` until the
+  // result has reached its API consumer. The callback must be invoked exactly
+  // once on the operation's sequence.
+  virtual void OnOperationComplete(absl::AnyInvocable<void() &&> callback) {
+    std::move(callback)();
+  }
 
  protected:
   ~CreateSessionDescriptionObserver() override = default;

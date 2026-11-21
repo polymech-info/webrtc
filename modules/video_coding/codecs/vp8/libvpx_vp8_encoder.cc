@@ -17,6 +17,7 @@
 #include <iterator>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
@@ -52,12 +53,12 @@
 #include "modules/video_coding/codecs/vp8/vp8_scalability.h"
 #include "modules/video_coding/include/video_codec_interface.h"
 #include "modules/video_coding/include/video_error_codes.h"
+#include "modules/video_coding/utility/frame_sampler.h"
 #include "modules/video_coding/utility/simulcast_rate_allocator.h"
 #include "modules/video_coding/utility/simulcast_utility.h"
 #include "modules/video_coding/utility/vp8_constants.h"
 #include "rtc_base/checks.h"
 #include "rtc_base/experiments/field_trial_parser.h"
-#include "rtc_base/experiments/psnr_experiment.h"
 #include "rtc_base/logging.h"
 #include "rtc_base/numerics/safe_conversions.h"
 #include "rtc_base/trace_event.h"
@@ -342,8 +343,7 @@ LibvpxVp8Encoder::LibvpxVp8Encoder(const Environment& env,
       max_frame_drop_interval_(ParseFrameDropInterval(env_.field_trials())),
       android_specific_threading_settings_(env_.field_trials().IsEnabled(
           "WebRTC-LibvpxVp8Encoder-AndroidSpecificThreadingSettings")),
-      psnr_experiment_(env.field_trials()),
-      psnr_frame_sampler_(psnr_experiment_.SamplingInterval()) {
+      psnr_frame_sampler_(FrameSampler::kDefaultPsnrFrameSamplingInterval) {
   raw_images_.reserve(kMaxSimulcastStreams);
   encoded_images_.reserve(kMaxSimulcastStreams);
   send_stream_.reserve(kMaxSimulcastStreams);
@@ -455,6 +455,40 @@ void LibvpxVp8Encoder::SetRates(const RateControlParameters& parameters) {
                           << ", details: "
                           << libvpx_->codec_error_detail(&encoders_[i]);
     }
+  }
+}
+
+void LibvpxVp8Encoder::SetComplexity(
+    std::span<const VideoCodecComplexity> complexity_by_spatial_layer,
+    ComplexityControlMode /*complexity_control_mode*/) {
+  if (!inited_) {
+    return;
+  }
+  for (size_t i = 0; i < encoders_.size(); ++i) {
+    const size_t stream_idx = encoders_.size() - 1 - i;
+    const VideoCodecComplexity complexity =
+        complexity_by_spatial_layer.empty()
+            ? VideoCodecComplexity::kComplexityNormal
+            : complexity_by_spatial_layer[std::min(
+                  stream_idx, complexity_by_spatial_layer.size() - 1)];
+    switch (complexity) {
+      case VideoCodecComplexity::kComplexityLow:
+        cpu_speed_[i] = -12;
+        break;
+      case VideoCodecComplexity::kComplexityNormal:
+        cpu_speed_[i] = -10;
+        break;
+      case VideoCodecComplexity::kComplexityHigh:
+        cpu_speed_[i] = -7;
+        break;
+      case VideoCodecComplexity::kComplexityHigher:
+        cpu_speed_[i] = -5;
+        break;
+      case VideoCodecComplexity::kComplexityMax:
+        cpu_speed_[i] = -4;
+        break;
+    }
+    libvpx_->codec_control(&encoders_[i], VP8E_SET_CPUUSED, cpu_speed_[i]);
   }
 }
 
@@ -1023,6 +1057,8 @@ int LibvpxVp8Encoder::Encode(const VideoFrame& frame,
   if (encoded_complete_callback_ == nullptr)
     return WEBRTC_VIDEO_CODEC_UNINITIALIZED;
 
+  // A keyframe request on any stream triggers a keyframe on all streams
+  // in order to keep the temporal layering structure aligned.
   bool key_frame_requested = false;
   for (size_t i = 0; i < key_frame_request_.size() && i < send_stream_.size();
        ++i) {
@@ -1093,8 +1129,7 @@ int LibvpxVp8Encoder::Encode(const VideoFrame& frame,
   }
 
 #if defined(WEBRTC_ENCODER_PSNR_STATS) && defined(VPX_EFLAG_CALCULATE_PSNR)
-  if (psnr_experiment_.IsEnabled() &&
-      psnr_frame_sampler_.ShouldBeSampled(frame)) {
+  if (psnr_frame_sampler_.ShouldBeSampled(frame)) {
     for (size_t i = 0; i < encoders_.size(); ++i) {
       flags[i] |= VPX_EFLAG_CALCULATE_PSNR;
     }

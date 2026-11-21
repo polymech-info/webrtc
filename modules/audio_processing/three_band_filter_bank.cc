@@ -181,7 +181,7 @@ void ThreeBandFilterBank::Analysis(
   // Initialize the output to zero.
   for (int band = 0; band < ThreeBandFilterBank::kNumBands; ++band) {
     RTC_DCHECK_EQ(out[band].size(), kSplitBandSize);
-    std::fill(out[band].begin(), out[band].end(), 0.0f);
+    std::fill(out[band].begin(), out[band].end(), 0);
   }
 
   for (int downsampling_index = 0; downsampling_index < kSubSampling;
@@ -233,7 +233,7 @@ void ThreeBandFilterBank::Analysis(
 void ThreeBandFilterBank::Synthesis(
     std::span<const std::span<float>, ThreeBandFilterBank::kNumBands> in,
     std::span<float, kFullBandSize> out) {
-  std::fill(out.begin(), out.end(), 0.0f);
+  std::fill(out.begin(), out.end(), 0);
   for (int upsampling_index = 0; upsampling_index < kSubSampling;
        ++upsampling_index) {
     for (int in_shift = 0; in_shift < kStride; ++in_shift) {

@@ -20,33 +20,35 @@
 #include <cstdint>
 #include <cstring>
 #include <optional>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "absl/strings/string_view.h"
 #include "api/field_trials_view.h"
+#include "api/sequence_checker.h"
 #include "api/task_queue/pending_task_safety_flag.h"
+#include "rtc_base/checks.h"
+#include "rtc_base/ip_address.h"
+#include "rtc_base/logging.h"
 #include "rtc_base/net_helpers.h"
 #include "rtc_base/network_constants.h"
 #include "rtc_base/network_monitor.h"
+#include "rtc_base/strings/string_builder.h"
 #include "rtc_base/thread.h"
+#include "sdk/android/generated_base_jni/NetworkChangeDetector_jni.h"
+#include "sdk/android/generated_base_jni/NetworkMonitor_jni.h"
+#include "sdk/android/native_api/jni/java_types.h"
 #include "sdk/android/native_api/jni/scoped_java_ref.h"
+#include "sdk/android/src/jni/jni_helpers.h"
 #include "sdk/android/src/jni/jvm.h"
+#include "third_party/jni_zero/jni_zero.h"
+
 #ifndef RTLD_NOLOAD
 // This was added in Lollipop to dlfcn.h
 #define RTLD_NOLOAD 4
 #endif
-
-#include "api/sequence_checker.h"
-#include "rtc_base/checks.h"
-#include "rtc_base/ip_address.h"
-#include "rtc_base/logging.h"
-#include "rtc_base/strings/string_builder.h"
-#include "sdk/android/generated_base_jni/NetworkChangeDetector_jni.h"
-#include "sdk/android/generated_base_jni/NetworkMonitor_jni.h"
-#include "sdk/android/native_api/jni/java_types.h"
-#include "sdk/android/src/jni/jni_helpers.h"
 
 namespace webrtc {
 namespace jni {
@@ -167,8 +169,10 @@ static AdapterType AdapterTypeFromNetworkType(NetworkType network_type,
 
 static IPAddress JavaToNativeIpAddress(JNIEnv* jni,
                                        const JavaRef<jobject>& j_ip_address) {
-  std::vector<int8_t> address =
-      JavaToNativeByteArray(jni, Java_IPAddress_getAddress(jni, j_ip_address));
+  jni_zero::ScopedJavaLocalRef<jbyteArray> jbyte_array_ref =
+      Java_IPAddress_getAddress(jni, j_ip_address);
+  JavaByteArrayRef byte_array_ref(jni, jbyte_array_ref);
+  std::span<const uint8_t> address = byte_array_ref.AsSpan();
   size_t address_length = address.size();
   if (address_length == 4) {
     // IP4
@@ -675,9 +679,7 @@ NetworkMonitorInterface* AndroidNetworkMonitorFactory::CreateNetworkMonitor(
                                    j_application_context_, field_trials);
 }
 
-void AndroidNetworkMonitor::NotifyConnectionTypeChanged(
-    JNIEnv* env,
-    const JavaRef<jobject>& j_caller) {
+void AndroidNetworkMonitor::NotifyConnectionTypeChanged(JNIEnv* env) {
   network_thread_->PostTask(SafeTask(safety_flag_, [this] {
     RTC_LOG(LS_INFO)
         << "Android network monitor detected connection type change.";
@@ -687,7 +689,6 @@ void AndroidNetworkMonitor::NotifyConnectionTypeChanged(
 
 void AndroidNetworkMonitor::NotifyOfActiveNetworkList(
     JNIEnv* env,
-    const JavaRef<jobject>& j_caller,
     const JavaRef<jobjectArray>& j_network_infos) {
   std::vector<NetworkInformation> network_infos =
       JavaToNativeVector<NetworkInformation>(env, j_network_infos,
@@ -697,7 +698,6 @@ void AndroidNetworkMonitor::NotifyOfActiveNetworkList(
 
 void AndroidNetworkMonitor::NotifyOfNetworkConnect(
     JNIEnv* env,
-    const JavaRef<jobject>& j_caller,
     const JavaRef<jobject>& j_network_info) {
   NetworkInformation network_info =
       GetNetworkInformationFromJava(env, j_network_info);
@@ -709,7 +709,6 @@ void AndroidNetworkMonitor::NotifyOfNetworkConnect(
 
 void AndroidNetworkMonitor::NotifyOfNetworkDisconnect(
     JNIEnv* env,
-    const JavaRef<jobject>& j_caller,
     jlong network_handle) {
   network_thread_->PostTask(SafeTask(safety_flag_, [this, network_handle] {
     OnNetworkDisconnected_n(static_cast<NetworkHandle>(network_handle));
@@ -718,7 +717,6 @@ void AndroidNetworkMonitor::NotifyOfNetworkDisconnect(
 
 void AndroidNetworkMonitor::NotifyOfNetworkPreference(
     JNIEnv* env,
-    const JavaRef<jobject>& j_caller,
     const JavaRef<jobject>& j_connection_type,
     jint jpreference) {
   NetworkType type = GetNetworkTypeFromJava(env, j_connection_type);
@@ -731,3 +729,6 @@ void AndroidNetworkMonitor::NotifyOfNetworkPreference(
 
 }  // namespace jni
 }  // namespace webrtc
+
+DEFINE_JNI(NetworkChangeDetector)
+DEFINE_JNI(NetworkMonitor)

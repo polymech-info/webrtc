@@ -43,7 +43,6 @@ int Win32PriorityFromThreadPriority(ThreadPriority priority) {
     case ThreadPriority::kRealtime:
       return THREAD_PRIORITY_TIME_CRITICAL;
   }
-  return THREAD_PRIORITY_NORMAL;
 }
 #endif
 

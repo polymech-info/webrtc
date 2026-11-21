@@ -13,10 +13,10 @@
 #include <openssl/bio.h>
 #include <openssl/err.h>
 #include <openssl/ssl.h>
-#include <openssl/ssl3.h>
 #include <openssl/x509.h>
 
 #include <cerrno>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <ctime>
@@ -42,7 +42,6 @@
 #include "rtc_base/ssl_identity.h"
 #include "rtc_base/ssl_stream_adapter.h"
 #include "rtc_base/strings/str_join.h"
-#include "rtc_base/strings/string_builder.h"
 #include "rtc_base/thread.h"
 
 #ifdef OPENSSL_IS_BORINGSSL
@@ -164,14 +163,12 @@ static void LogSslError() {
   uint32_t error_code;
   const char* file;
   int line;
-  do {
-    error_code = ERR_get_error_line(&file, &line);
+  while ((error_code = ERR_get_error_line(&file, &line)) != 0) {
     if (ERR_GET_LIB(error_code) == ERR_LIB_SSL) {
       RTC_LOG(LS_ERROR) << "ERR_LIB_SSL: " << error_code << ", " << file << ":"
                         << line;
-      break;
     }
-  } while (error_code != 0);
+  }
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -179,7 +176,6 @@ static void LogSslError() {
 /////////////////////////////////////////////////////////////////////////////
 
 namespace webrtc {
-
 
 bool OpenSSLAdapter::InitializeSSL() {
   // TODO: https://issues.webrtc.org/issues/339300437 - remove once
@@ -235,12 +231,6 @@ void OpenSSLAdapter::SetAlpnProtocols(const std::vector<std::string>& protos) {
 
 void OpenSSLAdapter::SetEllipticCurves(const std::vector<std::string>& curves) {
   elliptic_curves_ = curves;
-}
-
-void OpenSSLAdapter::SetMode(SSLMode mode) {
-  RTC_DCHECK(!ssl_ctx_);
-  RTC_DCHECK(state_ == SSL_NONE);
-  ssl_mode_ = mode;
 }
 
 void OpenSSLAdapter::SetCertVerifier(
@@ -426,6 +416,9 @@ int OpenSSLAdapter::ContinueSSL() {
     case SSL_ERROR_WANT_WRITE:
       break;
 
+    case SSL_ERROR_SSL:
+      LogSslError();
+      [[fallthrough]];
     case SSL_ERROR_ZERO_RETURN:
     default:
       RTC_LOG(LS_WARNING) << "ContinueSSL -- error " << code;
@@ -782,35 +775,15 @@ bool OpenSSLAdapter::SSLPostConnectionCheck(SSL* ssl, absl::string_view host) {
   return is_valid_cert_name;
 }
 
-void OpenSSLAdapter::SSLInfoCallback(const SSL* ssl, int where, int ret) {
-  switch (where) {
-    case SSL_CB_LOOP:
-    case SSL_CB_READ:
-    case SSL_CB_WRITE:
-      return;
-    default:
-      break;
-  }
-  StringBuilder ss;
-  ss << SSL_state_string_long(ssl);
-  if (ret == 0) {
-    RTC_LOG(LS_ERROR) << "Error during " << ss.str() << "\n";
-    return;
-  }
-  // See SSL_alert_type_string_long.
-  int severity_class = where >> 8;
-  switch (severity_class) {
-    case SSL3_AL_WARNING:
-    case SSL3_AL_FATAL:
-      ss << " " << SSL_alert_type_string_long(ret);
-      ss << " " << SSL_alert_desc_string_long(ret);
-      RTC_LOG(LS_WARNING) << ss.str();
-      break;
-    default:
-      RTC_LOG(LS_INFO) << ss.str();
-      break;
-  }
-}
+// The ContainsDistrustedCertificate checks in SSLVerifyCallback below see the
+// certificates the peer presented in the handshake and, in the X509 build, the
+// chain OpenSSL built from them. This leaves two gaps when a custom
+// SSLCertificateVerifier builds its own path: intermediates it adds itself,
+// e.g. from a cache or via AIA fetching, are not checked, so a server could
+// leave a distrusted intermediate out of the handshake; and the trust anchor it
+// chains to is not checked either. Conversely, a distrusted certificate that
+// the peer presents but that is not needed for the path still causes the chain
+// to be rejected. All of this is acceptable for this defense-in-depth check.
 
 #ifdef WEBRTC_USE_CRYPTO_BUFFER_CALLBACK
 // static
@@ -821,6 +794,17 @@ enum ssl_verify_result_t OpenSSLAdapter::SSLVerifyCallback(SSL* ssl,
       reinterpret_cast<OpenSSLAdapter*>(SSL_get_app_data(ssl));
 
   ssl_verify_result_t ret = stream->SSLVerifyInternal(ssl, out_alert);
+
+  // Reject chains containing distrusted certificates even if accepted by the
+  // custom verifier.
+  if (ret == ssl_verify_ok &&
+      openssl::ContainsDistrustedCertificate(SSL_get0_peer_certificates(ssl))) {
+    RTC_LOG(LS_WARNING) << "Peer certificate chain contains a distrusted "
+                           "certificate.";
+    stream->custom_cert_verifier_status_ = false;
+    *out_alert = SSL_AD_BAD_CERTIFICATE;
+    ret = ssl_verify_invalid;
+  }
 
   // Should only be used for debugging and development.
   if (ret != ssl_verify_ok && stream->ignore_bad_cert_) {
@@ -874,6 +858,21 @@ int OpenSSLAdapter::SSLVerifyCallback(int status, X509_STORE_CTX* store) {
   // Update status with the custom verifier.
   // Status is unchanged if verification fails.
   status = stream->SSLVerifyInternal(status, ssl, store);
+
+  // Reject chains containing distrusted certificates even if accepted by the
+  // trust store or custom verifier. The untrusted stack holds the certificates
+  // the peer presented; the chain is the path built so far, which may also
+  // include certificates from the trust store.
+  if (status && (openssl::ContainsDistrustedCertificate(
+                     X509_STORE_CTX_get0_untrusted(store)) ||
+                 openssl::ContainsDistrustedCertificate(
+                     X509_STORE_CTX_get0_chain(store)))) {
+    RTC_LOG(LS_WARNING) << "Certificate chain contains a distrusted "
+                           "certificate.";
+    X509_STORE_CTX_set_error(store, X509_V_ERR_CERT_REJECTED);
+    stream->custom_cert_verifier_status_ = false;
+    status = 0;
+  }
 
   // Should only be used for debugging and development.
   if (!status && stream->ignore_bad_cert_) {
@@ -993,7 +992,7 @@ SSL_CTX* OpenSSLAdapter::CreateContext(SSLMode mode, bool enable_cache) {
 #endif  // WEBRTC_EXCLUDE_BUILT_IN_SSL_ROOT_CERTS
 
 #if !defined(NDEBUG)
-  SSL_CTX_set_info_callback(ctx, SSLInfoCallback);
+  SSL_CTX_set_info_callback(ctx, openssl::SSLInfoCallback);
 #endif
 
 #ifdef OPENSSL_IS_BORINGSSL

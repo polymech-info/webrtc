@@ -49,7 +49,6 @@
 #include "rtc_base/network/received_packet.h"
 #include "rtc_base/network/sent_packet.h"
 #include "rtc_base/socket_address.h"
-#include "rtc_base/span_helpers.h"
 #include "rtc_base/string_encode.h"
 #include "rtc_base/string_utils.h"
 #include "rtc_base/strings/string_builder.h"
@@ -81,10 +80,10 @@ const int kPortTimeoutDelay = STUN_TOTAL_TIMEOUT + 5000;
 
 }  // namespace
 
-Port::Port(const PortParametersRef& args, IceCandidateType type)
-    : Port(args, type, 0, 0, true) {}
+Port::Port(PortParametersRef args, IceCandidateType type)
+    : Port(std::move(args), type, 0, 0, true) {}
 
-Port::Port(const PortParametersRef& args,
+Port::Port(PortParametersRef args,
            IceCandidateType type,
            uint16_t min_port,
            uint16_t max_port,
@@ -94,13 +93,13 @@ Port::Port(const PortParametersRef& args,
       factory_(args.socket_factory),
       lna_permission_factory_(args.lna_permission_factory),
       type_(type),
-      send_retransmit_count_attribute_(false),
+      send_retransmit_count_attribute_(args.send_retransmit_count_attribute),
       network_(args.network),
       min_port_(min_port),
       max_port_(max_port),
       content_name_(args.content_name),
-      component_(ICE_CANDIDATE_COMPONENT_DEFAULT),
-      generation_(0),
+      component_(args.component),
+      generation_(args.generation),
       ice_username_fragment_(args.ice_username_fragment),
       password_(args.ice_password),
       timeout_delay_(kPortTimeoutDelay),
@@ -131,9 +130,27 @@ Port::Port(const PortParametersRef& args,
         OnNetworkSliceChanged(network);
       });
 
+  RegisterCallbacks(std::move(args.callbacks));
+
   PostDestroyIfDead(/*delayed=*/true);
   RTC_LOG(LS_INFO) << ToString() << ": Port created with network cost "
                    << network_cost_;
+}
+
+void Port::RegisterCallbacks(Callbacks&& callbacks) {
+  RTC_DCHECK_RUN_ON(thread_);
+  candidate_ready_callback_ = std::move(callbacks.candidate_ready);
+  candidate_error_callback_ = std::move(callbacks.candidate_error);
+  port_complete_callback_ = std::move(callbacks.port_complete);
+  if (callbacks.port_destroyed) {
+    port_destroyed_callback_list_.AddReceiver(
+        callbacks.tag, std::move(callbacks.port_destroyed));
+  }
+  port_error_callback_ = std::move(callbacks.port_error);
+  if (callbacks.unknown_address) {
+    unknown_address_callbacks_.AddReceiver(
+        callbacks.tag, std::move(callbacks.unknown_address));
+  }
 }
 
 Port::~Port() {
@@ -160,11 +177,6 @@ IceRole Port::GetIceRole() const {
 void Port::SetIceRole(IceRole role) {
   RTC_DCHECK_RUN_ON(thread_);
   ice_role_ = role;
-}
-
-void Port::SetIceTiebreaker(uint64_t tiebreaker) {
-  RTC_DCHECK_RUN_ON(thread_);
-  ice_tiebreaker_ = tiebreaker;
 }
 
 uint64_t Port::IceTiebreaker() const {
@@ -205,7 +217,7 @@ Connection* Port::GetConnection(const SocketAddress& remote_addr) {
   RTC_DCHECK_RUN_ON(thread_);
   AddressMap::const_iterator iter = connections_.find(remote_addr);
   if (iter != connections_.end())
-    return iter->second;
+    return iter->second.get();
   else
     return nullptr;
 }
@@ -305,72 +317,40 @@ void Port::PostAddAddress(bool is_final) {
   }
 }
 
-[[deprecated]] void Port::SubscribePortComplete(
-    absl::AnyInvocable<void(Port*)> callback) {
-  RTC_DCHECK_RUN_ON(thread_);
-  port_complete_callback_list_.AddReceiver(std::move(callback));
-}
-
-void Port::SubscribePortComplete(const void* tag,
-                                 absl::AnyInvocable<void(Port*)> callback) {
-  RTC_DCHECK_RUN_ON(thread_);
-  port_complete_callback_list_.AddReceiver(tag, std::move(callback));
-}
-
-void Port::SubscribeCandidateError(
-    const void* tag,
-    std::function<void(Port*, const IceCandidateErrorEvent&)> callback) {
-  RTC_DCHECK_RUN_ON(thread_);
-  candidate_error_callback_list_.AddReceiver(tag, std::move(callback));
-}
-
 void Port::SendCandidateError(const IceCandidateErrorEvent& event) {
   RTC_DCHECK_RUN_ON(thread_);
-  candidate_error_callback_list_.Send(this, event);
-}
-
-[[deprecated]] void Port::SubscribeCandidateReadyCallback(
-    absl::AnyInvocable<void(Port*, const Candidate&)> callback) {
-  RTC_DCHECK_RUN_ON(thread_);
-  candidate_ready_callback_list_.AddReceiver(std::move(callback));
-}
-
-void Port::SubscribeCandidateReadyCallback(
-    const void* tag,
-    absl::AnyInvocable<void(Port*, const Candidate&)> callback) {
-  RTC_DCHECK_RUN_ON(thread_);
-  candidate_ready_callback_list_.AddReceiver(tag, std::move(callback));
-}
-
-[[deprecated]] void Port::SubscribePortError(
-    absl::AnyInvocable<void(Port*)> callback) {
-  RTC_DCHECK_RUN_ON(thread_);
-  port_error_callback_list_.AddReceiver(std::move(callback));
-}
-
-void Port::SubscribePortError(const void* tag,
-                              absl::AnyInvocable<void(Port*)> callback) {
-  RTC_DCHECK_RUN_ON(thread_);
-  port_error_callback_list_.AddReceiver(tag, std::move(callback));
+  if (candidate_error_callback_) {
+    candidate_error_callback_(this, event);
+  }
 }
 
 void Port::AddOrReplaceConnection(Connection* conn) {
   RTC_DCHECK_RUN_ON(thread_);
-  auto ret = connections_.insert(
-      std::make_pair(conn->remote_candidate().address(), conn));
-  // If there is a different connection on the same remote address, replace
-  // it with the new one and destroy the old one.
-  if (ret.second == false && ret.first->second != conn) {
-    RTC_LOG(LS_WARNING)
-        << ToString()
-        << ": A new connection was created on an existing remote address. "
-           "New remote candidate: "
-        << conn->remote_candidate().ToSensitiveString();
-    std::unique_ptr<Connection> old_conn = absl::WrapUnique(ret.first->second);
-    ret.first->second = conn;
-    HandleConnectionDestroyed(old_conn.get());
-    old_conn->Shutdown();
+  // Calling insert directly here is not desirable. An insert call wraps the
+  // input connection into a temporary unique_ptr. If the insert fails due to
+  // existing key, the temporary unique_ptr is destroyed, deleting the
+  // connection with it.
+
+  auto [iter, inserted] =
+      connections_.try_emplace(conn->remote_candidate().address(), nullptr);
+  if (inserted) {
+    // New address — map takes ownership.
+    iter->second = absl::WrapUnique(conn);
+    return;
   }
+
+  // The same connection should not be passed more than once. Check for it.
+  RTC_CHECK_NE(iter->second.get(), conn);
+  // Same address, different connection — replace the old one.
+  RTC_LOG(LS_WARNING)
+      << ToString()
+      << ": A new connection was created on an existing remote address. "
+         "New remote candidate: "
+      << conn->remote_candidate().ToSensitiveString();
+  std::unique_ptr<Connection> old_conn = std::move(iter->second);
+  iter->second = absl::WrapUnique(conn);
+  HandleConnectionDestroyed(old_conn.get());
+  old_conn->Shutdown();
 }
 
 void Port::OnReadPacket(const ReceivedIpPacket& packet, ProtocolType proto) {
@@ -395,6 +375,19 @@ void Port::OnReadPacket(const ReceivedIpPacket& packet, ProtocolType proto) {
   } else if (!msg) {
     // STUN message handled already
   } else if (msg->type() == STUN_BINDING_REQUEST) {
+    if (ice_role_ == ICEROLE_UNKNOWN) {
+      // The port has not been assigned an ICE role, which means that it has
+      // not been taken over by an ICE agent (yet), e.g. because it was pruned
+      // before becoming ready. Without a role the request can't be handled
+      // (see MaybeIceRoleConflict), so drop it.
+      RTC_LOG(LS_WARNING) << ToString() << ": Dropping "
+                          << StunMethodToString(msg->type())
+                          << " id=" << hex_encode(msg->transaction_id())
+                          << " from unknown address "
+                          << addr.ToSensitiveString()
+                          << " since the port has no ICE role.";
+      return;
+    }
     RTC_LOG(LS_INFO) << "Received " << StunMethodToString(msg->type())
                      << " id=" << hex_encode(msg->transaction_id())
                      << " from unknown address " << addr.ToSensitiveString();
@@ -632,7 +625,6 @@ void Port::DestroyAllConnections() {
   RTC_DCHECK_RUN_ON(thread_);
   for (auto& [unused, connection] : connections_) {
     connection->Shutdown();
-    delete connection;
   }
   connections_.clear();
 }
@@ -886,12 +878,6 @@ void Port::DestroyIfDead() {
   }
 }
 
-[[deprecated]] void Port::SubscribePortDestroyed(
-    std::function<void(PortInterface*)> callback) {
-  RTC_DCHECK_RUN_ON(thread_);
-  port_destroyed_callback_list_.AddReceiver(std::move(callback));
-}
-
 void Port::SubscribePortDestroyed(
     const void* tag,
     std::function<void(PortInterface*)> callback) {
@@ -925,9 +911,11 @@ void Port::OnNetworkSliceChanged(const ::webrtc::Network* network) {
 std::string Port::ToString() const {
   RTC_DCHECK_RUN_ON(thread_);
   StringBuilder ss;
+  // Fits the typical description without reallocations.
+  ss.Reserve(128);
   ss << "Port[" << ToHex(reinterpret_cast<uintptr_t>(this)) << ":"
      << content_name_ << ":" << component_ << ":" << generation_ << ":"
-     << IceCandidateTypeToString(type_) << ":" << network_->ToString() << "]";
+     << IceCandidateTypeToString(type_) << ":" << *network_ << "]";
   return ss.Release();
 }
 
@@ -956,17 +944,31 @@ void Port::EnablePortPackets() {
   enable_port_packets_ = true;
 }
 
-bool Port::OnConnectionDestroyed(Connection* conn) {
+void Port::DestroyConnectionInternal(Connection* conn, bool async) {
   RTC_DCHECK_RUN_ON(thread_);
-  if (connections_.erase(conn->remote_candidate().address()) == 0) {
+  auto iter = connections_.find(conn->remote_candidate().address());
+  if (iter == connections_.end() || iter->second.get() != conn) {
     // This could indicate a programmer error outside of webrtc so while we
     // do have this check here to alert external developers, we also need to
     // handle it since it might be a corner case not caught in tests.
     RTC_DCHECK_NOTREACHED() << "Calling Destroy recursively?";
-    return false;
+    return;
   }
+  std::unique_ptr<Connection> owned_conn = std::move(iter->second);
+  connections_.erase(iter);
 
-  HandleConnectionDestroyed(conn);
+  HandleConnectionDestroyed(owned_conn.get());
+  owned_conn->Shutdown();
+
+  if (async) {
+    // Unwind the stack before deleting the object in case upstream callers
+    // need to refer to the Connection's state as part of teardown.
+    // NOTE: We move ownership of `conn` into the capture section of the lambda
+    // so that the object will always be deleted, including if PostTask fails.
+    // In such a case, deletion would happen inside of the call
+    // to `DestroyConnection()`.
+    thread_->PostTask([owned_conn = std::move(owned_conn)]() {});
+  }
 
   // Ports time out after all connections fail if it is not marked as
   // "keep alive until pruned."
@@ -976,27 +978,6 @@ bool Port::OnConnectionDestroyed(Connection* conn) {
   if (connections_.empty()) {
     last_time_all_connections_removed_ = env_.clock().TimeInMilliseconds();
     PostDestroyIfDead(/*delayed=*/true);
-  }
-
-  return true;
-}
-
-void Port::DestroyConnectionInternal(Connection* conn, bool async) {
-  RTC_DCHECK_RUN_ON(thread_);
-  if (!OnConnectionDestroyed(conn))
-    return;
-
-  conn->Shutdown();
-  if (async) {
-    // Unwind the stack before deleting the object in case upstream callers
-    // need to refer to the Connection's state as part of teardown.
-    // NOTE: We move ownership of `conn` into the capture section of the lambda
-    // so that the object will always be deleted, including if PostTask fails.
-    // In such a case (only tests), deletion would happen inside of the call
-    // to `DestroyConnection()`.
-    thread_->PostTask([conn = absl::WrapUnique(conn)]() {});
-  } else {
-    delete conn;
   }
 }
 
@@ -1079,16 +1060,6 @@ void Port::NotifyRoleConflict() {
   role_conflict_callback_();
 }
 
-[[deprecated]] void Port::SubscribeUnknownAddress(
-    absl::AnyInvocable<void(PortInterface*,
-                            const SocketAddress&,
-                            ProtocolType,
-                            IceMessage*,
-                            const std::string&,
-                            bool)> callback) {
-  unknown_address_callbacks_.AddReceiver(std::move(callback));
-}
-
 void Port::SubscribeUnknownAddress(const void* tag,
                                    absl::AnyInvocable<void(PortInterface*,
                                                            const SocketAddress&,
@@ -1108,19 +1079,6 @@ void Port::NotifyUnknownAddress(PortInterface* port,
   unknown_address_callbacks_.Send(port, address, proto, msg, rf, port_muxed);
 }
 
-// deprecated
-void Port::SubscribeReadPacket(
-    absl::AnyInvocable<
-        void(PortInterface*, const char*, size_t, const SocketAddress&)>
-        callback) {
-  SubscribeReadPacket(
-      nullptr, [cb = std::move(callback)](PortInterface* port,
-                                          std::span<const uint8_t> data,
-                                          const SocketAddress& addr) mutable {
-        cb(port, AsCharSpan(data).data(), data.size(), addr);
-      });
-}
-
 void Port::SubscribeReadPacket(
     const void* tag,
     absl::AnyInvocable<void(PortInterface*,
@@ -1133,12 +1091,6 @@ void Port::NotifyReadPacket(PortInterface* port,
                             std::span<const uint8_t> data,
                             const SocketAddress& remote_address) {
   read_packet_callbacks_.Send(port, data, remote_address);
-}
-
-[[deprecated]] void Port::SubscribeSentPacket(
-
-    absl::AnyInvocable<void(const SentPacketInfo&)> callback) {
-  sent_packet_callbacks_.AddReceiver(std::move(callback));
 }
 
 void Port::SubscribeSentPacket(

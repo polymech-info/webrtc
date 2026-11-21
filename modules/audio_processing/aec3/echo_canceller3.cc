@@ -322,14 +322,6 @@ EchoCanceller3Config AdjustConfig(const EchoCanceller3Config& config,
     adjusted_cfg.filter.initial_state_seconds = 2.0f;
   }
 
-  if (field_trials.IsEnabled("WebRTC-Aec3HighPassFilterEchoReference")) {
-    adjusted_cfg.filter.high_pass_filter_echo_reference = true;
-  }
-
-  if (field_trials.IsEnabled("WebRTC-Aec3EchoSaturationDetectionKillSwitch")) {
-    adjusted_cfg.ep_strength.echo_can_saturate = false;
-  }
-
   const std::string use_nearend_reverb_len_tunings =
       field_trials.Lookup("WebRTC-Aec3UseNearendReverbLen");
   FieldTrialParameter<double> nearend_reverb_default_len(
@@ -810,8 +802,7 @@ EchoCanceller3::EchoCanceller3(
     linear_output_framer_.reset(
         new BlockFramer(/*num_bands=*/1, num_capture_channels_));
     linear_output_block_ =
-        std::make_unique<Block>(/*num_bands=*/1,
-                                static_cast<int>(num_capture_channels_));
+        std::make_unique<Block>(/*num_bands=*/1, num_capture_channels_);
     linear_output_sub_frame_view_ = std::vector<std::vector<std::span<float>>>(
         1, std::vector<std::span<float>>(num_capture_channels_));
   }

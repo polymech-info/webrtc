@@ -297,6 +297,7 @@ class VirtualSocketServer : public SocketServer {
   void SetMessageQueue(Thread* queue) override;
   bool Wait(TimeDelta max_wait_duration, bool process_io) override;
   void WakeUp() override;
+  bool CanCreateSockets() const override { return true; }
 
   void SetDelayOnAddress(const SocketAddress& address, int delay_ms) {
     delay_by_ip_[address.ipaddr()] = delay_ms;
@@ -382,10 +383,6 @@ class VirtualSocketServer : public SocketServer {
   uint32_t SendDelay(uint32_t size) RTC_LOCKS_EXCLUDED(mutex_);
 
   // Sending was previously blocked, but now isn't.
-  [[deprecated]] void SubscribeReadyToSend(
-      absl::AnyInvocable<void()> callback) {
-    ready_to_send_callbacks_.AddReceiver(std::move(callback));
-  }
   void SubscribeReadyToSend(void* tag, absl::AnyInvocable<void()> callback) {
     ready_to_send_callbacks_.AddReceiver(tag, std::move(callback));
   }

@@ -235,7 +235,7 @@ class PeerConnectionEncodingsIntegrationTest : public ::testing::Test {
   scoped_refptr<PeerConnectionTestWrapper> CreatePc(
       absl::string_view field_trials = "") {
     auto pc_wrapper = make_ref_counted<PeerConnectionTestWrapper>(
-        "pc", env_, &pss_, background_thread_.get(), background_thread_.get());
+        "pc", env_, &pss_, background_thread_.get());
     pc_wrapper->CreatePc({}, CreateBuiltinAudioEncoderFactory(),
                          CreateBuiltinAudioDecoderFactory(),
                          CreateTestFieldTrialsPtr(field_trials));
@@ -381,8 +381,7 @@ class PeerConnectionEncodingsIntegrationTest : public ::testing::Test {
       scoped_refptr<PeerConnectionTestWrapper> pc_wrapper) {
     auto observer = make_ref_counted<MockCreateSessionDescriptionObserver>();
     pc_wrapper->pc()->CreateOffer(observer.get(), {});
-    EXPECT_THAT(WaitUntil([&] { return observer->called(); }, IsTrue()),
-                IsRtcOk());
+    EXPECT_TRUE(WaitUntil([&] { return observer->called(); }));
     return observer->MoveDescription();
   }
 
@@ -390,8 +389,7 @@ class PeerConnectionEncodingsIntegrationTest : public ::testing::Test {
       scoped_refptr<PeerConnectionTestWrapper> pc_wrapper) {
     auto observer = make_ref_counted<MockCreateSessionDescriptionObserver>();
     pc_wrapper->pc()->CreateAnswer(observer.get(), {});
-    EXPECT_THAT(WaitUntil([&] { return observer->called(); }, IsTrue()),
-                IsRtcOk());
+    EXPECT_TRUE(WaitUntil([&] { return observer->called(); }));
     return observer->MoveDescription();
   }
 
@@ -456,8 +454,6 @@ TEST_F(PeerConnectionEncodingsIntegrationTest,
   auto stats_result =
       GetStatsUntil(local_pc_wrapper, HasOutboundRtpBytesSent(1));
   ASSERT_THAT(stats_result, IsRtcOk());
-  EXPECT_THAT(GetOutboundRtpStreamStatsByRid(stats_result.value()),
-              ElementsAre(Pair("", ResolutionIs(1280, 720))));
 
   // Verify codec and scalability mode.
   scoped_refptr<const RTCStatsReport> report = stats_result.value();
@@ -659,6 +655,14 @@ TEST_F(PeerConnectionEncodingsIntegrationTest,
       GetCapabilitiesAndRestrictToCodec(remote_pc_wrapper, "VP9");
   transceiver->SetCodecPreferences(codecs);
 
+  scoped_refptr<RtpSenderInterface> sender = transceiver->sender();
+  RtpParameters parameters = sender->GetParameters();
+  // Keep this legacy SVC test independent of simulcast's default scaling.
+  for (RtpEncodingParameters& encoding : parameters.encodings) {
+    encoding.scale_resolution_down_by = 1.0;
+  }
+  ASSERT_TRUE(sender->SetParameters(parameters).ok());
+
   NegotiateWithSimulcastTweaks(local_pc_wrapper, remote_pc_wrapper);
   local_pc_wrapper->WaitForConnection();
   remote_pc_wrapper->WaitForConnection();
@@ -680,7 +684,6 @@ TEST_F(PeerConnectionEncodingsIntegrationTest,
   // Despite SVC being used on a single RTP stream, GetParameters() returns the
   // three encodings that we configured earlier (this is not spec-compliant but
   // it is how legacy SVC behaves).
-  scoped_refptr<RtpSenderInterface> sender = transceiver->sender();
   std::vector<RtpEncodingParameters> encodings =
       sender->GetParameters().encodings;
   ASSERT_EQ(encodings.size(), 3u);
@@ -1231,6 +1234,10 @@ TEST_F(PeerConnectionEncodingsIntegrationTest, VP9_TargetBitrate_LegacyL1T3) {
   // disabling the bottom two spatial layers resulting in L1T3.
   scoped_refptr<RtpSenderInterface> sender = transceiver->sender();
   RtpParameters parameters = sender->GetParameters();
+  // Keep this legacy SVC test independent of simulcast's default scaling.
+  for (RtpEncodingParameters& encoding : parameters.encodings) {
+    encoding.scale_resolution_down_by = 1.0;
+  }
   parameters.encodings[0].active = false;
   parameters.encodings[1].active = false;
   parameters.encodings[2].active = true;
@@ -1877,8 +1884,10 @@ TEST_F(PeerConnectionEncodingsIntegrationTest,
 // still work.
 TEST_F(PeerConnectionEncodingsIntegrationTest,
        SetParametersAcceptsMungedCodecFromGetParameters) {
-  scoped_refptr<PeerConnectionTestWrapper> local_pc_wrapper = CreatePc();
-  scoped_refptr<PeerConnectionTestWrapper> remote_pc_wrapper = CreatePc();
+  scoped_refptr<PeerConnectionTestWrapper> local_pc_wrapper =
+      CreatePc("WebRTC-NoSdpMangleAllowForTesting/Enabled,85/");
+  scoped_refptr<PeerConnectionTestWrapper> remote_pc_wrapper =
+      CreatePc("WebRTC-NoSdpMangleAllowForTesting/Enabled,85/");
   ExchangeIceCandidates(local_pc_wrapper, remote_pc_wrapper);
 
   auto transceiver_or_error =
@@ -3081,7 +3090,8 @@ TEST_P(PeerConnectionEncodingsIntegrationParameterizedTest,
   // Confirm 640x360 is sent.
   EXPECT_THAT(
       GetStatsUntil(local_pc_wrapper,
-                    OutboundRtpStatsAre(ElementsAre(ResolutionIs(640, 360)))),
+                    OutboundRtpStatsAre(ElementsAre(ResolutionIs(640, 360))),
+                    {.timeout = kLongTimeoutForRampingUp}),
       IsRtcOk());
 }
 
@@ -3119,7 +3129,8 @@ TEST_P(PeerConnectionEncodingsIntegrationParameterizedTest,
   // Confirm 640x360 is sent.
   EXPECT_THAT(
       GetStatsUntil(local_pc_wrapper,
-                    OutboundRtpStatsAre(ElementsAre(ResolutionIs(640, 360)))),
+                    OutboundRtpStatsAre(ElementsAre(ResolutionIs(640, 360))),
+                    {.timeout = kLongTimeoutForRampingUp}),
       IsRtcOk());
 }
 
@@ -3155,7 +3166,7 @@ class PeerConnectionEncodingsFakeCodecsIntegrationTest
         std::make_unique<FakeWebRtcVideoDecoderFactory>();
     video_decoder_factory->AddSupportedVideoCodecType("H265");
     auto pc_wrapper = make_ref_counted<PeerConnectionTestWrapper>(
-        "pc", env_, &pss_, background_thread_.get(), background_thread_.get());
+        "pc", env_, &pss_, background_thread_.get());
     pc_wrapper->CreatePc(
         {}, CreateBuiltinAudioEncoderFactory(),
         CreateBuiltinAudioDecoderFactory(), std::move(video_encoder_factory),
@@ -3193,7 +3204,7 @@ class PeerConnectionEncodingsFakeCodecsIntegrationTest
                         {"profile-level-id", "f4001f"}},  // recvonly
                        {ScalabilityMode::kL1T1}));
     auto pc_wrapper = make_ref_counted<PeerConnectionTestWrapper>(
-        "pc", env_, &pss_, background_thread_.get(), background_thread_.get());
+        "pc", env_, &pss_, background_thread_.get());
     pc_wrapper->CreatePc(
         {}, CreateBuiltinAudioEncoderFactory(),
         CreateBuiltinAudioDecoderFactory(), std::move(video_encoder_factory),
@@ -3498,6 +3509,105 @@ TEST_F(PeerConnectionEncodingsIntegrationTest,
 
   RtpParameters parameters = transceiver->sender()->GetParameters();
   EXPECT_TRUE(transceiver->sender()->SetParameters(parameters).ok());
+}
+
+TEST_F(PeerConnectionEncodingsIntegrationTest,
+       QualityLimitationReasonReportsBandwidthInMaintainFrameRate) {
+  scoped_refptr<PeerConnectionTestWrapper> local_pc_wrapper = CreatePc();
+  scoped_refptr<PeerConnectionTestWrapper> remote_pc_wrapper = CreatePc();
+  ExchangeIceCandidates(local_pc_wrapper, remote_pc_wrapper);
+
+  scoped_refptr<MediaStreamInterface> stream = local_pc_wrapper->GetUserMedia(
+      /*audio=*/false, {}, /*video=*/true, {.width = 1280, .height = 720},
+      /*fps=*/10);
+  scoped_refptr<VideoTrackInterface> track = stream->GetVideoTracks()[0];
+
+  RTCErrorOr<scoped_refptr<RtpTransceiverInterface>> transceiver_or_error =
+      local_pc_wrapper->pc()->AddTransceiver(track);
+  ASSERT_THAT(transceiver_or_error, IsRtcOk());
+  scoped_refptr<RtpTransceiverInterface> transceiver =
+      transceiver_or_error.MoveValue();
+
+  scoped_refptr<RtpSenderInterface> sender = transceiver->sender();
+  RtpParameters parameters = sender->GetParameters();
+  ASSERT_THAT(parameters.encodings, SizeIs(1));
+  parameters.degradation_preference = DegradationPreference::MAINTAIN_FRAMERATE;
+  parameters.encodings[0].max_bitrate_bps = 30000;
+  EXPECT_THAT(sender->SetParameters(parameters), IsRtcOk());
+
+  Negotiate(local_pc_wrapper, remote_pc_wrapper);
+  local_pc_wrapper->WaitForConnection();
+  remote_pc_wrapper->WaitForConnection();
+
+  // Wait for 60 frames of video to be sent, this should give some impression of
+  // what the resolution and limitations are.
+  auto error_or_stats = GetStatsUntil(
+      local_pc_wrapper,
+      OutboundRtpStatsAre(UnorderedElementsAre(FramesEncodedIs(Gt(60)))),
+      {.timeout = kLongTimeoutForRampingUp});
+  ASSERT_THAT(error_or_stats, IsRtcOk());
+  scoped_refptr<const RTCStatsReport> report = error_or_stats.MoveValue();
+  std::vector<const RTCOutboundRtpStreamStats*> outbound_rtps =
+      report->GetStatsOfType<RTCOutboundRtpStreamStats>();
+  ASSERT_THAT(outbound_rtps, SizeIs(1u));
+  // 720p should not be achieved, but frame rate should be 10 fps (+/- 2 fps
+  // to reduce risk of flakes).
+  EXPECT_LT(outbound_rtps[0]->frame_width.value_or(0), 1280u);
+  EXPECT_LT(outbound_rtps[0]->frame_height.value_or(0), 720u);
+  EXPECT_GE(outbound_rtps[0]->frames_per_second.value_or(0), 8);   // >= 8 fps
+  EXPECT_LE(outbound_rtps[0]->frames_per_second.value_or(0), 12);  // <= 12 fps
+  // The reason being "bandwidth" limited...
+  EXPECT_EQ(outbound_rtps[0]->quality_limitation_reason, "bandwidth");
+}
+
+TEST_F(PeerConnectionEncodingsIntegrationTest,
+       QualityLimitationReasonReportsBandwidthInMaintainResolution) {
+  scoped_refptr<PeerConnectionTestWrapper> local_pc_wrapper = CreatePc();
+  scoped_refptr<PeerConnectionTestWrapper> remote_pc_wrapper = CreatePc();
+  ExchangeIceCandidates(local_pc_wrapper, remote_pc_wrapper);
+
+  scoped_refptr<MediaStreamInterface> stream = local_pc_wrapper->GetUserMedia(
+      /*audio=*/false, {}, /*video=*/true, {.width = 1280, .height = 720},
+      /*fps=*/10);
+  scoped_refptr<VideoTrackInterface> track = stream->GetVideoTracks()[0];
+
+  RTCErrorOr<scoped_refptr<RtpTransceiverInterface>> transceiver_or_error =
+      local_pc_wrapper->pc()->AddTransceiver(track);
+  ASSERT_THAT(transceiver_or_error, IsRtcOk());
+  scoped_refptr<RtpTransceiverInterface> transceiver =
+      transceiver_or_error.MoveValue();
+
+  scoped_refptr<RtpSenderInterface> sender = transceiver->sender();
+  RtpParameters parameters = sender->GetParameters();
+  ASSERT_THAT(parameters.encodings, SizeIs(1));
+  parameters.degradation_preference =
+      DegradationPreference::MAINTAIN_RESOLUTION;
+  parameters.encodings[0].max_bitrate_bps = 10000;
+  EXPECT_THAT(sender->SetParameters(parameters), IsRtcOk());
+
+  Negotiate(local_pc_wrapper, remote_pc_wrapper);
+  local_pc_wrapper->WaitForConnection();
+  remote_pc_wrapper->WaitForConnection();
+
+  // Wait for 30 frames of 720p to be sent, this should give some impression of
+  // what the frame rate and limitations are.
+  auto error_or_stats = GetStatsUntil(
+      local_pc_wrapper,
+      OutboundRtpStatsAre(
+          UnorderedElementsAre(AllOf(HeightIs(720), FramesEncodedIs(Gt(30))))),
+      {.timeout = kLongTimeoutForRampingUp});
+  ASSERT_THAT(error_or_stats, IsRtcOk());
+  scoped_refptr<const RTCStatsReport> report = error_or_stats.MoveValue();
+  std::vector<const RTCOutboundRtpStreamStats*> outbound_rtps =
+      report->GetStatsOfType<RTCOutboundRtpStreamStats>();
+  ASSERT_THAT(outbound_rtps, SizeIs(1u));
+  // 720p is guaranteed because of "maintain-resolution", but if the test setup
+  // is correct, less than 80% of fps should be achieved due to BW limitation.
+  EXPECT_EQ(outbound_rtps[0]->frame_width.value_or(0), 1280u);
+  EXPECT_EQ(outbound_rtps[0]->frame_height.value_or(0), 720u);
+  EXPECT_LT(outbound_rtps[0]->frames_per_second.value_or(0), 8);
+  // The limitation should be reported correctly.
+  EXPECT_EQ(outbound_rtps[0]->quality_limitation_reason, "bandwidth");
 }
 
 }  // namespace webrtc

@@ -21,8 +21,7 @@ if (rtc_include_tests) {
   }
 
   if (!build_with_chromium) {
-    rtc_library("voip_core_unittests") {
-      testonly = true
+    rtc_cc_test("voip_core_unittest") {
       sources = [ "voip_core_unittest.cc" ]
       deps = [
         "..:voip_core",
@@ -32,7 +31,6 @@ if (rtc_include_tests) {
         "../../../api/audio_codecs:audio_codecs_api",
         "../../../api/audio_codecs:builtin_audio_decoder_factory",
         "../../../api/audio_codecs:builtin_audio_encoder_factory",
-        "../../../api/environment:environment_factory",
         "../../../api/voip:voip_api",
         "../../../modules/audio_device:mock_audio_device",
         "../../../modules/audio_processing:mocks",
@@ -44,8 +42,7 @@ if (rtc_include_tests) {
     }
   }
 
-  rtc_library("audio_channel_unittests") {
-    testonly = true
+  rtc_cc_test("audio_channel_unittest") {
     sources = [ "audio_channel_unittest.cc" ]
     deps = [
       ":mock_task_queue",
@@ -64,14 +61,14 @@ if (rtc_include_tests) {
       "../../../modules/audio_mixer:audio_mixer_test_utils",
       "../../../modules/rtp_rtcp:rtp_rtcp_format",
       "../../../system_wrappers",
+      "../../../test:create_test_field_trials",
       "../../../test:mock_transport",
       "../../../test:test_support",
       "//third_party/abseil-cpp/absl/functional:any_invocable",
     ]
   }
 
-  rtc_library("audio_ingress_unittests") {
-    testonly = true
+  rtc_cc_test("audio_ingress_unittest") {
     sources = [ "audio_ingress_unittest.cc" ]
     deps = [
       "..:audio_egress",
@@ -85,7 +82,6 @@ if (rtc_include_tests) {
       "../../../api/audio_codecs:builtin_audio_decoder_factory",
       "../../../api/audio_codecs:builtin_audio_encoder_factory",
       "../../../api/environment",
-      "../../../api/environment:environment_factory",
       "../../../api/neteq:neteq_api",
       "../../../api/units:time_delta",
       "../../../api/units:timestamp",
@@ -99,8 +95,7 @@ if (rtc_include_tests) {
     ]
   }
 
-  rtc_library("audio_egress_unittests") {
-    testonly = true
+  rtc_cc_test("audio_egress_unittest") {
     sources = [ "audio_egress_unittest.cc" ]
     deps = [
       "..:audio_egress",
@@ -111,13 +106,13 @@ if (rtc_include_tests) {
       "../../../api/audio_codecs:audio_codecs_api",
       "../../../api/audio_codecs:builtin_audio_encoder_factory",
       "../../../api/environment",
-      "../../../api/environment:environment_factory",
       "../../../api/units:time_delta",
       "../../../api/units:timestamp",
       "../../../modules/audio_mixer:audio_mixer_test_utils",
       "../../../modules/rtp_rtcp",
       "../../../modules/rtp_rtcp:rtp_rtcp_format",
       "../../../rtc_base:rtc_event",
+      "../../../test:create_test_environment",
       "../../../test:mock_transport",
       "../../../test:test_support",
       "../../../test/time_controller",

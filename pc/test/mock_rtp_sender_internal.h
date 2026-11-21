@@ -11,6 +11,7 @@
 #ifndef PC_TEST_MOCK_RTP_SENDER_INTERNAL_H_
 #define PC_TEST_MOCK_RTP_SENDER_INTERNAL_H_
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -67,10 +68,7 @@ class MockRtpSenderInternal : public RtpSenderInternal {
               (std::optional<RtpParameters>),
               (override));
   MOCK_METHOD(RtpParameters, GetParameters, (), (const, override));
-  MOCK_METHOD(RtpParameters,
-              GetParametersInternal,
-              (bool, bool),
-              (const, override));
+  MOCK_METHOD(RtpParameters, GetParametersInternal, (bool), (const, override));
   MOCK_METHOD(RtpParameters,
               GetParametersInternalWithAllLayers,
               (),
@@ -124,7 +122,7 @@ class MockRtpSenderInternal : public RtpSenderInternal {
   MOCK_METHOD(void, SetSsrc, (uint32_t), (override));
   MOCK_METHOD(ScopedOperationsBatcher::BatchTaskWithFinalizer,
               SetSsrcTask,
-              (uint32_t),
+              (uint32_t, size_t),
               (override));
   MOCK_METHOD(void,
               set_stream_ids,

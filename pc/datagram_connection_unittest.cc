@@ -23,6 +23,7 @@
 #include "api/make_ref_counted.h"
 #include "api/scoped_refptr.h"
 #include "api/test/mock_datagram_connection_observer.h"
+#include "api/transport/ecn_marking.h"
 #include "api/transport/enums.h"
 #include "api/units/timestamp.h"
 #include "modules/rtp_rtcp/source/rtp_packet.h"
@@ -32,6 +33,7 @@
 #include "p2p/base/p2p_constants.h"
 #include "p2p/test/fake_ice_transport.h"
 #include "pc/datagram_connection_internal.h"
+#include "pc/dtls_packet_processor.h"
 #include "pc/test/fake_rtc_certificate_generator.h"
 #include "rtc_base/copy_on_write_buffer.h"
 #include "rtc_base/network/sent_packet.h"
@@ -50,7 +52,6 @@ namespace {
 using ::testing::_;
 using ::testing::ElementsAre;
 using ::testing::ElementsAreArray;
-using ::testing::Invoke;
 using ::testing::NiceMock;
 using ::testing::Return;
 
@@ -85,10 +86,10 @@ class DatagramConnectionTest : public ::testing::Test {
     std::string transport_name2 = "FakeTransport2";
 
     auto ice1 = std::make_unique<FakeIceTransportInternal>(
-        transport_name1, ICE_CANDIDATE_COMPONENT_RTP);
+        env_, transport_name1, ICE_CANDIDATE_COMPONENT_RTP);
     ice1->SetAsync(true);
     auto ice2 = std::make_unique<FakeIceTransportInternal>(
-        transport_name2, ICE_CANDIDATE_COMPONENT_RTP);
+        env_, transport_name2, ICE_CANDIDATE_COMPONENT_RTP);
     ice2->SetAsync(true);
     ice1_ = ice1.get();
     ice2_ = ice2.get();
@@ -187,6 +188,7 @@ TEST_F(DatagramConnectionTest, ObserverCalledOnReceivedRtpPacket) {
   RtpPacketReceived packet;
   packet.Parse(packet_data);
   packet.set_arrival_time(Timestamp::Seconds(1234));
+  packet.set_ecn(EcnMarking::kCe);
 
   bool callback_called = false;
   EXPECT_CALL(*observer1_ptr_, OnPacketReceived(_, _))
@@ -197,11 +199,38 @@ TEST_F(DatagramConnectionTest, ObserverCalledOnReceivedRtpPacket) {
             EXPECT_EQ(
                 memcmp(data.data(), packet_data.data(), packet_data.size()), 0);
             EXPECT_EQ(metadata.receive_time, packet.arrival_time());
+            EXPECT_EQ(metadata.ecn, packet.ecn());
             callback_called = true;
             loop_.Quit();
           });
 
   conn1_->OnRtpPacket(packet);
+
+  loop_.Run();
+  EXPECT_TRUE(callback_called);
+}
+
+TEST_F(DatagramConnectionTest, DtlsWithFeedbackPacketReportsEcnMarking) {
+  CreateConnections(WireProtocol::kDtlsWithFeedback);
+
+  const std::vector<uint8_t> payload = {1, 2, 3, 4, 5};
+  DtlsPacketProcessor sender;
+  CopyOnWriteBuffer wire =
+      sender.ProcessOutgoingPacket(payload, Timestamp::Millis(1));
+
+  bool callback_called = false;
+  EXPECT_CALL(*observer1_ptr_, OnPacketReceived)
+      .WillOnce(
+          [&](std::span<const uint8_t> data,
+              const DatagramConnection::Observer::PacketMetadata& metadata) {
+            EXPECT_THAT(data, ElementsAreArray(payload));
+            EXPECT_EQ(metadata.receive_time, Timestamp::Millis(2));
+            EXPECT_EQ(metadata.ecn, EcnMarking::kCe);
+            callback_called = true;
+            loop_.Quit();
+          });
+
+  conn1_->OnDtlsPacket(wire, Timestamp::Millis(2), EcnMarking::kCe);
 
   loop_.Run();
   EXPECT_TRUE(callback_called);
@@ -542,6 +571,56 @@ TEST_F(DatagramConnectionTest, SingleBytePacketsAreSent) {
   EXPECT_GT(ice1_->last_sent_packet().size(), data.size());
   loop_.Run();
   EXPECT_TRUE(callback_called);
+}
+
+TEST_F(DatagramConnectionTest, DtlsWithFeedbackPacketsAreReceived) {
+  CreateConnections(WireProtocol::kDtlsWithFeedback);
+  Connect();
+
+  ASSERT_TRUE(
+      WaitUntil([&]() { return conn1_->Writable() && conn2_->Writable(); }));
+
+  std::vector<uint8_t> data = {1, 2, 3, 4, 5};
+  struct Callbacks {
+    bool packet_received = false;
+    bool send_outcome = false;
+  } callbacks;
+
+  auto check_done = [&] {
+    if (callbacks.packet_received && callbacks.send_outcome)
+      loop_.Quit();
+  };
+
+  // The app payload must be delivered intact, i.e. with the transport header
+  // stripped off by the DtlsPacketProcessor.
+  EXPECT_CALL(*observer2_ptr_, OnPacketReceived(_, _))
+      .WillOnce(
+          [&](std::span<const uint8_t> received_data,
+              const DatagramConnection::Observer::PacketMetadata& metadata) {
+            ASSERT_EQ(received_data.size(), data.size());
+            EXPECT_EQ(memcmp(received_data.data(), data.data(), data.size()),
+                      0);
+            callbacks.packet_received = true;
+            check_done();
+          });
+
+  EXPECT_CALL(*observer1_ptr_, OnSendOutcome(_))
+      .WillOnce([&](const SendOutcome& outcome) {
+        EXPECT_EQ(outcome.id, 1u);
+        EXPECT_EQ(outcome.status, SendOutcome::Status::kSuccess);
+        callbacks.send_outcome = true;
+        check_done();
+      });
+
+  std::vector<PacketSendParameters> packets = {
+      PacketSendParameters{.id = 1, .payload = data}};
+  conn1_->SendPackets(packets);
+  // The framed packet carries a transport header, so more than the payload is
+  // put on the wire (plus DTLS overhead).
+  EXPECT_GT(ice1_->last_sent_packet().size(), data.size());
+  loop_.Run();
+  EXPECT_TRUE(callbacks.packet_received);
+  EXPECT_TRUE(callbacks.send_outcome);
 }
 
 TEST_F(DatagramConnectionTest, InternalSentPacketsAreIgnored) {

@@ -41,6 +41,7 @@
 #include "api/sctp_transport_interface.h"
 #include "api/test/rtc_error_matchers.h"
 #include "api/units/time_delta.h"
+#include "pc/test/peer_connection_test_wrapper.h"
 #include "rtc_base/checks.h"
 #include "rtc_base/copy_on_write_buffer.h"
 #include "rtc_base/physical_socket_server.h"
@@ -50,11 +51,6 @@
 #include "test/gtest.h"
 #include "test/run_loop.h"
 #include "test/wait_until.h"
-
-#ifdef WEBRTC_ANDROID
-#include "pc/test/android_test_initializer.h"
-#endif
-#include "pc/test/peer_connection_test_wrapper.h"
 // Notice that mockpeerconnectionobservers.h must be included after the above!
 #include "pc/test/mock_peer_connection_observers.h"
 #include "test/mock_audio_decoder.h"
@@ -68,6 +64,7 @@ using ::testing::Ge;
 using ::testing::Gt;
 using ::testing::IsTrue;
 using ::testing::Ne;
+using ::testing::NotNull;
 using ::testing::SizeIs;
 using ::testing::StrictMock;
 using ::testing::Values;
@@ -83,24 +80,18 @@ class PeerConnectionEndToEndBaseTest : public ::testing::Test {
 
   explicit PeerConnectionEndToEndBaseTest(SdpSemantics sdp_semantics)
       : env_(CreateTestEnvironment()),
-        network_thread_(std::make_unique<Thread>(&pss_)),
-        worker_thread_(Thread::Create()) {
+        network_thread_(std::make_unique<Thread>(&pss_)) {
     RTC_CHECK(network_thread_->Start());
-    RTC_CHECK(worker_thread_->Start());
     caller_ = make_ref_counted<PeerConnectionTestWrapper>(
-        "caller", env_, &pss_, network_thread_.get(), worker_thread_.get());
+        "caller", env_, &pss_, network_thread_.get());
     callee_ = make_ref_counted<PeerConnectionTestWrapper>(
-        "callee", env_, &pss_, network_thread_.get(), worker_thread_.get());
+        "callee", env_, &pss_, network_thread_.get());
     PeerConnectionInterface::IceServer ice_server;
     ice_server.uri = "stun:stun.l.google.com:19302";
     caller_config_.servers.push_back(ice_server);
     caller_config_.sdp_semantics = sdp_semantics;
     callee_config_.servers.push_back(ice_server);
     callee_config_.sdp_semantics = sdp_semantics;
-
-#ifdef WEBRTC_ANDROID
-    InitializeAndroidObjects();
-#endif
   }
 
   void CreatePcs(scoped_refptr<AudioEncoderFactory> audio_encoder_factory1,
@@ -169,11 +160,11 @@ class PeerConnectionEndToEndBaseTest : public ::testing::Test {
   void TestDataChannelSendAndReceive(DataChannelInterface* dc1,
                                      DataChannelInterface* dc2,
                                      size_t size = 6) {
-    std::unique_ptr<MockDataChannelObserver> dc1_observer(
-        new MockDataChannelObserver(dc1));
+    auto dc1_observer =
+        std::make_unique<MockDataChannelObserver>(network_thread_.get(), dc1);
 
-    std::unique_ptr<MockDataChannelObserver> dc2_observer(
-        new MockDataChannelObserver(dc2));
+    auto dc2_observer =
+        std::make_unique<MockDataChannelObserver>(network_thread_.get(), dc2);
 
     static const std::string kDummyData =
         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -251,7 +242,6 @@ class PeerConnectionEndToEndBaseTest : public ::testing::Test {
   PhysicalSocketServer pss_;
   Environment env_;
   std::unique_ptr<Thread> network_thread_;
-  std::unique_ptr<Thread> worker_thread_;
   scoped_refptr<PeerConnectionTestWrapper> caller_;
   scoped_refptr<PeerConnectionTestWrapper> callee_;
   DataChannelList caller_signaled_data_channels_;
@@ -540,8 +530,10 @@ TEST_P(PeerConnectionEndToEndTest, DataChannelIdAssignment) {
   scoped_refptr<DataChannelInterface> callee_dc_1 =
       callee_->CreateDataChannel("data", init);
 
-  MockDataChannelObserver caller_dc_1_observer(caller_dc_1.get());
-  MockDataChannelObserver callee_dc_1_observer(callee_dc_1.get());
+  MockDataChannelObserver caller_dc_1_observer(network_thread_.get(),
+                                               caller_dc_1.get());
+  MockDataChannelObserver callee_dc_1_observer(network_thread_.get(),
+                                               callee_dc_1.get());
 
   Negotiate();
   WaitForConnection();
@@ -558,8 +550,10 @@ TEST_P(PeerConnectionEndToEndTest, DataChannelIdAssignment) {
   scoped_refptr<DataChannelInterface> callee_dc_2 =
       callee_->CreateDataChannel("data", init);
 
-  MockDataChannelObserver caller_dc_2_observer(caller_dc_2.get());
-  MockDataChannelObserver callee_dc_2_observer(callee_dc_2.get());
+  MockDataChannelObserver caller_dc_2_observer(network_thread_.get(),
+                                               caller_dc_2.get());
+  MockDataChannelObserver callee_dc_2_observer(network_thread_.get(),
+                                               callee_dc_2.get());
 
   EXPECT_TRUE(WaitUntil([&] { return caller_dc_2_observer.IsOpen(); }));
   EXPECT_TRUE(WaitUntil([&] { return callee_dc_2_observer.IsOpen(); }));
@@ -591,11 +585,11 @@ TEST_P(PeerConnectionEndToEndTest,
   WaitForDataChannelsToOpen(caller_dc_2.get(), callee_signaled_data_channels_,
                             1);
 
-  std::unique_ptr<MockDataChannelObserver> dc_1_observer(
-      new MockDataChannelObserver(callee_signaled_data_channels_[0].get()));
+  auto dc_1_observer = std::make_unique<MockDataChannelObserver>(
+      network_thread_.get(), callee_signaled_data_channels_[0].get());
 
-  std::unique_ptr<MockDataChannelObserver> dc_2_observer(
-      new MockDataChannelObserver(callee_signaled_data_channels_[1].get()));
+  auto dc_2_observer = std::make_unique<MockDataChannelObserver>(
+      network_thread_.get(), callee_signaled_data_channels_[1].get());
 
   const std::string message_1 = "hello 1";
   const std::string message_2 = "hello 2";
@@ -706,23 +700,36 @@ TEST_P(PeerConnectionEndToEndTest, TooManyDataChannelsOpenedBeforeConnecting) {
       caller_->pc()->GetSctpTransport();
   scoped_refptr<SctpTransportInterface> callee_transport =
       callee_->pc()->GetSctpTransport();
-  std::optional<int> caller_channels =
-      caller_transport->Information().MaxChannels();
-  std::optional<int> callee_channels =
-      callee_transport->Information().MaxChannels();
-  ASSERT_TRUE(caller_channels.has_value());
-  ASSERT_TRUE(callee_channels.has_value());
-  EXPECT_THAT(caller_channels.value(), Eq(kReducedMaxSctpStreams));
-  EXPECT_THAT(callee_channels.value(), Eq(kReducedMaxSctpStreams));
+  ASSERT_THAT(caller_transport, NotNull());
+  ASSERT_THAT(callee_transport, NotNull());
+  // SCTP handshake completes asynchronously after ICE connection; wait for
+  // MaxChannels to be negotiated.
+  EXPECT_THAT(
+      WaitUntil([&] { return caller_transport->Information().MaxChannels(); },
+                Eq(kReducedMaxSctpStreams),
+                {.timeout = TimeDelta::Millis(kMaxWait)}),
+      IsRtcOk());
+  EXPECT_THAT(
+      WaitUntil([&] { return callee_transport->Information().MaxChannels(); },
+                Eq(kReducedMaxSctpStreams),
+                {.timeout = TimeDelta::Millis(kMaxWait)}),
+      IsRtcOk());
   EXPECT_THAT(WaitUntil([&] { return callee_signaled_data_channels_; },
                         SizeIs(Ge(kReducedMaxSctpStreams / 2)),
                         {.timeout = TimeDelta::Millis(kMaxWait)}),
               IsRtcOk());
   // 0 and 2 should be open, 4 should be rejected as "ID too large".
-  EXPECT_EQ(DataChannelInterface::kOpen,
-            channels[(kReducedMaxSctpStreams / 2) - 1]->state());
-  EXPECT_EQ(DataChannelInterface::kClosed,
-            channels[kReducedMaxSctpStreams / 2]->state());
+  EXPECT_THAT(
+      WaitUntil(
+          [&] { return channels[(kReducedMaxSctpStreams / 2) - 1]->state(); },
+          Eq(DataChannelInterface::kOpen),
+          {.timeout = TimeDelta::Millis(kMaxWait)}),
+      IsRtcOk());
+  EXPECT_THAT(
+      WaitUntil([&] { return channels[kReducedMaxSctpStreams / 2]->state(); },
+                Eq(DataChannelInterface::kClosed),
+                {.timeout = TimeDelta::Millis(kMaxWait)}),
+      IsRtcOk());
 }
 
 // Verifies that max-message-size is propagated to the DataChannel.
@@ -733,7 +740,8 @@ TEST_P(PeerConnectionEndToEndTest, MaxMessageSizePropagated) {
   DataChannelInit init;
   scoped_refptr<DataChannelInterface> caller_dc =
       caller_->CreateDataChannel("caller", init);
-  MockDataChannelObserver caller_dc_observer(caller_dc.get());
+  MockDataChannelObserver caller_dc_observer(network_thread_.get(),
+                                             caller_dc.get());
 
   Negotiate();
   WaitForConnection();
@@ -748,8 +756,9 @@ TEST_P(PeerConnectionEndToEndTest, MaxMessageSizePropagated) {
 
   scoped_refptr<DataChannelInterface> callee_dc =
       callee_->CreateDataChannel("callee", init);
-  MockDataChannelObserver callee_dc_observer(callee_dc.get());
-  EXPECT_TRUE(WaitUntil([&] { return caller_dc_observer.IsOpen(); }));
+  MockDataChannelObserver callee_dc_observer(network_thread_.get(),
+                                             callee_dc.get());
+  EXPECT_TRUE(WaitUntil([&] { return callee_dc_observer.IsOpen(); }));
   EXPECT_FALSE(callee_dc->Send(buffer));
 }
 

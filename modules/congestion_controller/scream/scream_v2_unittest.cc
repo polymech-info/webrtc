@@ -10,6 +10,7 @@
 #include "modules/congestion_controller/scream/scream_v2.h"
 
 #include <algorithm>
+#include <cmath>
 
 #include "api/environment/environment.h"
 #include "api/transport/ecn_marking.h"
@@ -235,24 +236,58 @@ TEST(ScreamV2Test, CalculatesL4sAlpha) {
   Timestamp start_time = clock.CurrentTime();
   TimeDelta feedback_interval = TimeDelta::Millis(25);
 
-  TransportPacketsFeedback feedback =
-      CreateFeedback(clock.CurrentTime(), /*rtt=*/TimeDelta::Millis(10),
-                     /*number_of_ect1_packets=*/20,
-                     /*number_of_packets_in_flight=*/20);
-  // CE mark 20% of packets.
-  for (int i = 0; i < 4; ++i) {
-    feedback.packet_feedbacks[i].ecn = EcnMarking::kCe;
-  }
-
   double l4s_alpha = scream.l4s_alpha();
   while (clock.CurrentTime() < start_time + TimeDelta::Seconds(2)) {
-    feedback.feedback_time = clock.CurrentTime();
+    TransportPacketsFeedback feedback =
+        CreateFeedback(clock.CurrentTime(), /*rtt=*/TimeDelta::Millis(10),
+                       /*number_of_ect1_packets=*/20,
+                       /*number_of_packets_in_flight=*/20);
+    // CE mark 20% of packets.
+    for (int i = 0; i < 4; ++i) {
+      feedback.packet_feedbacks[i].ecn = EcnMarking::kCe;
+    }
     scream.OnTransportPacketsFeedback(feedback);
     EXPECT_GT(scream.l4s_alpha(), l4s_alpha);
     clock.AdvanceTime(feedback_interval);
   }
 
   EXPECT_NEAR(scream.l4s_alpha(), 0.2, 0.01);
+}
+
+TEST(ScreamV2Test, L4sAlphaScalesUpAndDownWithRtt) {
+  SimulatedClock clock(Timestamp::Seconds(1'234));
+  Environment env = CreateTestEnvironment({.time = &clock});
+  ScreamV2 scream(env);
+
+  TimeDelta rtt = TimeDelta::Millis(100);
+  TimeDelta feedback_interval = TimeDelta::Millis(25);
+
+  // First feedback with 100% CE marks at RTT = 100ms (steps_per_rtt = 4).
+  // With L4sAvgG = 1/16 and steps_per_rtt = 4, g = (1/16) / 4 = 1/64.
+  TransportPacketsFeedback ce_feedback =
+      CreateFeedback(clock.CurrentTime(), rtt,
+                     /*number_of_ect1_packets=*/20,
+                     /*number_of_packets_in_flight=*/20);
+  for (auto& packet : ce_feedback.packet_feedbacks) {
+    packet.ecn = EcnMarking::kCe;
+  }
+  scream.OnTransportPacketsFeedback(ce_feedback);
+  EXPECT_DOUBLE_EQ(scream.l4s_alpha(), (1.0 / 16.0) / 4.0);
+
+  // Next 4 feedbacks (1 RTT) with 0% CE marks.
+  // With L4sAvgG = 1/16 and steps_per_rtt = 4, g = (1/16) / 4 = 1/64.
+  double alpha_before_decay = scream.l4s_alpha();
+  for (int i = 0; i < 4; ++i) {
+    clock.AdvanceTime(feedback_interval);
+    TransportPacketsFeedback clear_feedback =
+        CreateFeedback(clock.CurrentTime(), rtt,
+                       /*number_of_ect1_packets=*/20,
+                       /*number_of_packets_in_flight=*/20);
+    scream.OnTransportPacketsFeedback(clear_feedback);
+  }
+  double expected_decay_factor = std::pow(1.0 - (1.0 / 16.0) / 4.0, 4);
+  EXPECT_NEAR(scream.l4s_alpha(), alpha_before_decay * expected_decay_factor,
+              1e-6);
 }
 
 struct AdaptsToLinkCapacityParams {
@@ -607,6 +642,139 @@ TEST(ScreamV2Test, LossEventsAreNotIgnoredIfQueueDelayIsDetected) {
   // Since queue delay is detected, the loss event is NOT ignored, and
   // ref_window should decrease!
   EXPECT_LT(scream.ref_window(), ref_window_before_loss);
+}
+
+TEST(ScreamV2Test, KeepsTrackOfReceivedRateOver100msWindow) {
+  SimulatedClock clock(Timestamp::Seconds(1'234));
+  Environment env = CreateTestEnvironment({.time = &clock});
+  ScreamV2 scream(env);
+
+  // Initialize constraints
+  scream.SetTargetBitrateConstraints(DataRate::Zero(),
+                                     DataRate::KilobitsPerSec(2000),
+                                     DataRate::KilobitsPerSec(300));
+
+  // First feedback
+  TransportPacketsFeedback feedback1 =
+      CreateFeedback(clock.CurrentTime(), /*rtt=*/TimeDelta::Millis(100),
+                     /*number_of_ect1_packets=*/5,
+                     /*number_of_packets_in_flight=*/20);
+  scream.OnTransportPacketsFeedback(feedback1);
+
+  // feedback1 has 5 packets of 1000 bytes each = 5000 bytes.
+  // At the first feedback, received_rate is initialized to PlusInfinity.
+  EXPECT_EQ(scream.received_rate(), DataRate::PlusInfinity());
+
+  // Advance sender clock by 200ms (feedback delayed on return path), but remote
+  // packet receive time only advances by 50ms (less than 100ms window on the
+  // receiver clock).
+  clock.AdvanceTime(TimeDelta::Millis(200));
+  TransportPacketsFeedback feedback2 =
+      CreateFeedback(clock.CurrentTime(), /*rtt=*/TimeDelta::Millis(100),
+                     /*number_of_ect1_packets=*/3,
+                     /*number_of_packets_in_flight=*/20);
+  for (auto& pkt : feedback2.packet_feedbacks) {
+    pkt.receive_time =
+        feedback1.packet_feedbacks.back().receive_time + TimeDelta::Millis(50);
+  }
+  scream.OnTransportPacketsFeedback(feedback2);
+
+  // feedback2 has 3 packets of 1000 bytes each = 3000 bytes.
+  // No new calculation because only 50ms has passed on the remote receive
+  // clock, even though 200ms passed on the sender clock.
+  // received_rate remains PlusInfinity.
+  EXPECT_EQ(scream.received_rate(), DataRate::PlusInfinity());
+
+  // Advance sender clock by another 250ms, but remote packet receive time only
+  // advances by 51ms (so total 101ms has passed on the remote receive clock
+  // since the last window update).
+  clock.AdvanceTime(TimeDelta::Millis(250));
+  TransportPacketsFeedback feedback3 =
+      CreateFeedback(clock.CurrentTime(), /*rtt=*/TimeDelta::Millis(100),
+                     /*number_of_ect1_packets=*/2,
+                     /*number_of_packets_in_flight=*/20);
+  for (auto& pkt : feedback3.packet_feedbacks) {
+    pkt.receive_time =
+        feedback2.packet_feedbacks.back().receive_time + TimeDelta::Millis(51);
+  }
+  scream.OnTransportPacketsFeedback(feedback3);
+
+  // feedback3 has 2 packets of 1000 bytes each = 2000 bytes.
+  // Total accumulated bytes since last calculation: 3000 (feedback2) + 2000
+  // (feedback3) = 5000 bytes.
+  // Total time duration passed on remote receive clock: 50ms + 51ms = 101ms
+  // (sender local duration was 200ms + 250ms = 450ms).
+  // Rate is calculated using remote receive duration: 5000 bytes / 101ms.
+  EXPECT_EQ(scream.received_rate(),
+            DataSize::Bytes(5000) / TimeDelta::Millis(101));
+}
+
+TEST(ScreamV2Test, MaxDataInFlightBoundedByMinMaxDataInFlightMss) {
+  SimulatedClock clock(Timestamp::Seconds(1'234));
+  Environment env_default = CreateTestEnvironment({.time = &clock});
+  ScreamV2 scream_default(env_default);
+  // Default min_ref_window is 1000 bytes, max_segment_size is 1280 bytes, and
+  // min_max_data_in_flight_mss is 4 -> 4 * 1280 = 5120 bytes.
+  EXPECT_EQ(scream_default.ref_window(), DataSize::Bytes(1000));
+  EXPECT_EQ(scream_default.max_data_in_flight(), DataSize::Bytes(4 * 1280));
+
+  Environment env_custom = CreateTestEnvironment(
+      {.field_trials = "WebRTC-Bwe-ScreamV2/MinMaxDataInFlightMss:5/",
+       .time = &clock});
+  ScreamV2 scream_custom(env_custom);
+  EXPECT_EQ(scream_custom.max_data_in_flight(), DataSize::Bytes(5 * 1280));
+}
+
+TEST(ScreamV2Test, DelayBackoffInhibitedWhenQueueDelayDecreases) {
+  SimulatedClock clock(Timestamp::Seconds(1'234));
+  Environment env = CreateTestEnvironment({.time = &clock});
+  ScreamV2 scream(env);
+  scream.SetTargetBitrateConstraints(DataRate::Zero(),
+                                     DataRate::KilobitsPerSec(2000),
+                                     DataRate::KilobitsPerSec(1000));
+  CcFeedbackGenerator feedback_generator(
+      {.network_config = {.queue_delay_ms = 25,
+                          .link_capacity = DataRate::KilobitsPerSec(1000)},
+       .send_as_ect1 = false});
+
+  // Overuse the 1 Mbps link by sending at 2 Mbps until queue delay builds up
+  // well above the congestion threshold (30 ms).
+  for (int i = 0; i < 10; ++i) {
+    TransportPacketsFeedback feedback =
+        feedback_generator.ProcessUntilNextFeedback(
+            DataRate::KilobitsPerSec(2000), clock,
+            [&](const SentPacket& packet) {
+              scream.OnPacketSent(packet.data_in_flight);
+            });
+    scream.OnTransportPacketsFeedback(feedback);
+  }
+  ASSERT_TRUE(scream.delay_based_congestion_control().IsQueueDelayDetected());
+  ASSERT_TRUE(scream.last_reference_window_decrease_time().IsFinite());
+
+  // Reduce send rate below link capacity (500 kbps) so the queue drains.
+  int drained_feedbacks_while_congested = 0;
+  for (int i = 0; i < 20; ++i) {
+    TimeDelta prev_queue_delay =
+        scream.delay_based_congestion_control().queue_delay();
+    DataSize prev_ref_window = scream.ref_window();
+    TransportPacketsFeedback feedback =
+        feedback_generator.ProcessUntilNextFeedback(
+            DataRate::KilobitsPerSec(500), clock,
+            [&](const SentPacket& packet) {
+              scream.OnPacketSent(packet.data_in_flight);
+            });
+    scream.OnTransportPacketsFeedback(feedback);
+
+    if (scream.delay_based_congestion_control().IsQueueDelayDetected() &&
+        scream.delay_based_congestion_control().queue_delay() <
+            prev_queue_delay) {
+      ++drained_feedbacks_while_congested;
+      // Even though queue delay is still above the congestion threshold,
+      // reference window must not decrease while queue delay is decreasing.
+      EXPECT_GE(scream.ref_window(), prev_ref_window);
+    }
+  }
+  EXPECT_GT(drained_feedbacks_while_congested, 0);
 }
 
 }  // namespace

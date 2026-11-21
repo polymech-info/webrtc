@@ -30,6 +30,7 @@
 #include "test/create_test_environment.h"
 #include "test/gmock.h"
 #include "test/gtest.h"
+#include "third_party/openh264/src/codec/api/wels/codec_app_def.h"
 
 using ::testing::AnyNumber;
 using ::testing::AtLeast;
@@ -201,6 +202,139 @@ TEST(H264EncoderImplTest, RejectsNativeFramesWithUnequalChromaStrides) {
                          .build();
 
   EXPECT_EQ(WEBRTC_VIDEO_CODEC_ENCODER_FAILURE, encoder.Encode(frame, nullptr));
+}
+
+TEST(H264EncoderImplTest, RejectsTooLargeResolution) {
+  H264EncoderImpl encoder(CreateTestEnvironment(), {});
+  VideoCodec codec_settings;
+  SetDefaultSettings(&codec_settings);
+
+  // Level 5.2 MaxFS is 36864 macroblocks.
+  // 4096 x 2304 = 256 x 144 macroblocks = 36864 macroblocks (Allowed).
+  codec_settings.width = 4096;
+  codec_settings.height = 2304;
+  EXPECT_EQ(WEBRTC_VIDEO_CODEC_OK,
+            encoder.InitEncode(&codec_settings, kSettings));
+
+  // 4096 x 2320 = 256 x 145 macroblocks = 37120 macroblocks (Too large).
+  codec_settings.width = 4096;
+  codec_settings.height = 2320;
+  EXPECT_EQ(WEBRTC_VIDEO_CODEC_ERR_PARAMETER,
+            encoder.InitEncode(&codec_settings, kSettings));
+}
+
+TEST(H264EncoderImplTest, RejectsSkewedAspectRatioWidth) {
+  H264EncoderImpl encoder(CreateTestEnvironment(), {});
+  VideoCodec codec_settings;
+  SetDefaultSettings(&codec_settings);
+
+  // Level 5.2 Max width in macroblocks is 543 (8688 pixels).
+  // 8688 x 16 = 543 x 1 macroblocks = 543 macroblocks (Allowed).
+  codec_settings.width = 8688;
+  codec_settings.height = 16;
+  EXPECT_EQ(WEBRTC_VIDEO_CODEC_OK,
+            encoder.InitEncode(&codec_settings, kSettings));
+
+  // 8704 x 16 = 544 x 1 macroblocks = 544 macroblocks (Too wide).
+  codec_settings.width = 8704;
+  codec_settings.height = 16;
+  EXPECT_EQ(WEBRTC_VIDEO_CODEC_ERR_PARAMETER,
+            encoder.InitEncode(&codec_settings, kSettings));
+}
+
+TEST(H264EncoderImplTest, RejectsSkewedAspectRatioHeight) {
+  H264EncoderImpl encoder(CreateTestEnvironment(), {});
+  VideoCodec codec_settings;
+  SetDefaultSettings(&codec_settings);
+
+  // Level 5.2 Max height in macroblocks is 543 (8688 pixels).
+  // 16 x 8688 = 1 x 543 macroblocks = 543 macroblocks (Allowed).
+  codec_settings.width = 16;
+  codec_settings.height = 8688;
+  EXPECT_EQ(WEBRTC_VIDEO_CODEC_OK,
+            encoder.InitEncode(&codec_settings, kSettings));
+
+  // 16 x 8704 = 1 x 544 macroblocks = 544 macroblocks (Too high).
+  codec_settings.width = 16;
+  codec_settings.height = 8704;
+  EXPECT_EQ(WEBRTC_VIDEO_CODEC_ERR_PARAMETER,
+            encoder.InitEncode(&codec_settings, kSettings));
+}
+
+TEST(H264EncoderImplTest, SetComplexity) {
+  H264EncoderImpl encoder(CreateTestEnvironment(), {});
+  VideoCodec codec_settings;
+  SetDefaultSettings(&codec_settings);
+  ASSERT_EQ(WEBRTC_VIDEO_CODEC_OK,
+            encoder.InitEncode(&codec_settings, kSettings));
+
+  const VideoCodecComplexity kLow[] = {VideoCodecComplexity::kComplexityLow};
+  encoder.SetComplexity(kLow, VideoEncoder::ComplexityControlMode::kConstant);
+  EXPECT_EQ(encoder.ComplexityModeForTesting(), LOW_COMPLEXITY);
+
+  const VideoCodecComplexity kNormal[] = {
+      VideoCodecComplexity::kComplexityNormal};
+  encoder.SetComplexity(kNormal,
+                        VideoEncoder::ComplexityControlMode::kConstant);
+  EXPECT_EQ(encoder.ComplexityModeForTesting(), LOW_COMPLEXITY);
+
+  const VideoCodecComplexity kHigh[] = {VideoCodecComplexity::kComplexityHigh};
+  encoder.SetComplexity(kHigh, VideoEncoder::ComplexityControlMode::kConstant);
+  EXPECT_EQ(encoder.ComplexityModeForTesting(), MEDIUM_COMPLEXITY);
+
+  const VideoCodecComplexity kHigher[] = {
+      VideoCodecComplexity::kComplexityHigher};
+  encoder.SetComplexity(kHigher,
+                        VideoEncoder::ComplexityControlMode::kConstant);
+  EXPECT_EQ(encoder.ComplexityModeForTesting(), HIGH_COMPLEXITY);
+
+  // Extra elements outside configured stream count should be ignored.
+  const VideoCodecComplexity kMaxWithExtra[] = {
+      VideoCodecComplexity::kComplexityMax,
+      VideoCodecComplexity::kComplexityLow};
+  encoder.SetComplexity(kMaxWithExtra,
+                        VideoEncoder::ComplexityControlMode::kConstant);
+  EXPECT_EQ(encoder.ComplexityModeForTesting(), HIGH_COMPLEXITY);
+}
+
+TEST(H264EncoderImplTest, SetComplexitySimulcast) {
+  H264EncoderImpl encoder(CreateTestEnvironment(), {});
+  VideoCodec codec_settings;
+  SetDefaultSettings(&codec_settings);
+  codec_settings.numberOfSimulcastStreams = 3;
+  codec_settings.simulcastStream[0] = {.width = 160,
+                                       .height = 120,
+                                       .maxFramerate = 60,
+                                       .maxBitrate = 200,
+                                       .targetBitrate = 100,
+                                       .minBitrate = 30,
+                                       .active = true};
+  codec_settings.simulcastStream[1] = {.width = 320,
+                                       .height = 240,
+                                       .maxFramerate = 60,
+                                       .maxBitrate = 500,
+                                       .targetBitrate = 300,
+                                       .minBitrate = 50,
+                                       .active = true};
+  codec_settings.simulcastStream[2] = {.width = 640,
+                                       .height = 480,
+                                       .maxFramerate = 60,
+                                       .maxBitrate = 2000,
+                                       .targetBitrate = 1000,
+                                       .minBitrate = 100,
+                                       .active = true};
+  ASSERT_EQ(WEBRTC_VIDEO_CODEC_OK,
+            encoder.InitEncode(&codec_settings, kSettings));
+
+  const VideoCodecComplexity kComplexities[] = {
+      VideoCodecComplexity::kComplexityLow,
+      VideoCodecComplexity::kComplexityHigh,
+      VideoCodecComplexity::kComplexityMax};
+  encoder.SetComplexity(kComplexities,
+                        VideoEncoder::ComplexityControlMode::kConstant);
+  EXPECT_EQ(encoder.ComplexityModeForTesting(0), LOW_COMPLEXITY);
+  EXPECT_EQ(encoder.ComplexityModeForTesting(1), MEDIUM_COMPLEXITY);
+  EXPECT_EQ(encoder.ComplexityModeForTesting(2), HIGH_COMPLEXITY);
 }
 
 }  // anonymous namespace

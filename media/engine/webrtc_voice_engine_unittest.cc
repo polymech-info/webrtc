@@ -34,8 +34,6 @@
 #include "api/call/transport.h"
 #include "api/crypto/crypto_options.h"
 #include "api/environment/environment.h"
-#include "api/environment/environment_factory.h"
-#include "api/field_trials.h"
 #include "api/make_ref_counted.h"
 #include "api/media_types.h"
 #include "api/payload_type.h"
@@ -44,10 +42,11 @@
 #include "api/rtc_error.h"
 #include "api/rtp_header_extension_id.h"
 #include "api/rtp_headers.h"
+#include "api/rtp_packet_infos.h"
 #include "api/rtp_parameters.h"
 #include "api/scoped_refptr.h"
 #include "api/transport/bitrate_settings.h"
-#include "api/transport/rtp/rtp_source.h"
+#include "api/units/timestamp.h"
 #include "call/audio_receive_stream.h"
 #include "call/audio_send_stream.h"
 #include "call/audio_state.h"
@@ -76,7 +75,6 @@
 #include "rtc_base/dscp.h"
 #include "rtc_base/numerics/safe_conversions.h"
 #include "test/create_test_environment.h"
-#include "test/create_test_field_trials.h"
 #include "test/gmock.h"
 #include "test/gtest.h"
 #include "test/mock_audio_decoder_factory.h"
@@ -192,7 +190,7 @@ std::vector<Codec> AddIdToCodecs(PayloadTypePicker& pt_mapper,
   std::vector<Codec> codecs = std::move(codecs_in);
   for (Codec& codec : codecs) {
     if (codec.id == Codec::kIdNotSet) {
-      auto id_or_error = pt_mapper.SuggestMapping(codec, nullptr);
+      auto id_or_error = pt_mapper.SuggestMapping(codec);
       EXPECT_TRUE(id_or_error.ok());
       if (id_or_error.ok()) {
         codec.id = id_or_error.value();
@@ -249,8 +247,7 @@ class WebRtcVoiceEngineTestFake : public ::testing::TestWithParam<bool> {
  public:
   explicit WebRtcVoiceEngineTestFake(absl::string_view field_trials_string = "")
       : use_null_apm_(GetParam()),
-        field_trials_(CreateTestFieldTrials(field_trials_string)),
-        env_(CreateEnvironment(&field_trials_)),
+        env_(CreateTestEnvironment({.field_trials = field_trials_string})),
         adm_(test::MockAudioDeviceModule::CreateStrict()),
         apm_(use_null_apm_
                  ? nullptr
@@ -297,7 +294,8 @@ class WebRtcVoiceEngineTestFake : public ::testing::TestWithParam<bool> {
     send_channel_ = engine_->CreateSendChannel(env_, &call_, MediaConfig(),
                                                AudioOptions(), CryptoOptions());
     receive_channel_ = engine_->CreateReceiveChannel(
-        env_, &call_, MediaConfig(), AudioOptions(), CryptoOptions());
+        env_, &call_, MediaConfig(), AudioOptions(), CryptoOptions(), nullptr,
+        [](uint32_t, const RtpPacketInfos&, Timestamp) {});
     return true;
   }
 
@@ -567,9 +565,9 @@ class WebRtcVoiceEngineTestFake : public ::testing::TestWithParam<bool> {
     auto& codecs = send_parameters_.codecs;
     codecs.clear();
     codecs.push_back(kOpusCodec);
-    codecs[0].params[kCodecParamMinBitrate] = min_bitrate_kbps;
-    codecs[0].params[kCodecParamStartBitrate] = start_bitrate_kbps;
-    codecs[0].params[kCodecParamMaxBitrate] = max_bitrate_kbps;
+    codecs[0].SetParam(kCodecParamMinBitrate, min_bitrate_kbps);
+    codecs[0].SetParam(kCodecParamStartBitrate, start_bitrate_kbps);
+    codecs[0].SetParam(kCodecParamMaxBitrate, max_bitrate_kbps);
     EXPECT_CALL(*call_.GetMockTransportControllerSend(),
                 SetSdpBitrateParameters(
                     AllOf(Field(&BitrateConstraints::min_bitrate_bps,
@@ -891,7 +889,6 @@ class WebRtcVoiceEngineTestFake : public ::testing::TestWithParam<bool> {
  protected:
   test::RunLoop run_loop_;
   const bool use_null_apm_;
-  FieldTrials field_trials_;
   const Environment env_;
   scoped_refptr<test::MockAudioDeviceModule> adm_;
   scoped_refptr<StrictMock<test::MockAudioProcessing>> apm_;
@@ -945,6 +942,15 @@ TEST_P(WebRtcVoiceEngineTestFake, CreateSendStream) {
   EXPECT_EQ("", config.rtp.c_name);
   EXPECT_EQ(0u, config.rtp.extensions.size());
   EXPECT_EQ(SendImpl()->transport(), config.send_transport);
+}
+
+// Test that a send stream that is added after the MID has been set is created
+// with the MID.
+TEST_P(WebRtcVoiceEngineTestFake, CreateSendStreamWithMid) {
+  EXPECT_TRUE(SetupChannel());
+  send_channel_->SetMid("audio");
+  EXPECT_TRUE(send_channel_->AddSendStream(StreamParams::CreateLegacy(kSsrcX)));
+  EXPECT_EQ(GetSendStreamConfig(kSsrcX).rtp.mid, "audio");
 }
 
 // Test that we can add a receive stream and that it has the correct defaults.
@@ -1326,7 +1332,6 @@ class WebRtcVoiceEngineTestWithAdaptivePtime
 };
 
 TEST_P(WebRtcVoiceEngineTestWithAdaptivePtime, AdaptivePtimeFieldTrial) {
-  // field_trials_.Set("WebRTC-Audio-AdaptivePtime", "enabled:true");
   EXPECT_TRUE(SetupSendStream());
   EXPECT_TRUE(GetAudioNetworkAdaptorConfig(kSsrcX));
 }
@@ -2341,12 +2346,12 @@ TEST_P(WebRtcVoiceEngineTestFake, SetSendCodecsCaseInsensitive) {
 
 TEST_P(WebRtcVoiceEngineTestFake,
        SupportsTransportSequenceNumberHeaderExtension) {
-  const std::vector<RtpExtension> header_extensions =
-      GetDefaultEnabledRtpHeaderExtensions(*engine_,
-                                           /* field_trials= */ nullptr);
+  const std::vector<RtpHeaderExtensionCapability> header_extensions =
+      GetDefaultEnabledRtpHeaderCapabilities(*engine_,
+                                             /* field_trials= */ nullptr);
   EXPECT_THAT(
       header_extensions,
-      Contains(::testing::Field("uri", &RtpExtension::uri,
+      Contains(::testing::Field("uri", &RtpHeaderExtensionCapability::uri,
                                 RtpExtension::kTransportSequenceNumberUri)));
 }
 
@@ -3340,6 +3345,27 @@ TEST_P(WebRtcVoiceEngineTestFake, SetsSyncGroupFromStreamId) {
       << "SyncGroup should be set based on stream id";
 }
 
+// Enabling Sframe before a send stream is added is propagated to the stream
+// config at construction.
+TEST_P(WebRtcVoiceEngineTestFake, EnableSframePropagatesToSendStreamConfig) {
+  ASSERT_TRUE(SetupChannel());
+  send_channel_->EnableSframe();
+
+  ASSERT_TRUE(send_channel_->AddSendStream(StreamParams::CreateLegacy(kSsrcX)));
+
+  EXPECT_TRUE(GetSendStreamConfig(kSsrcX).sframe_options.required);
+}
+
+// Enabling Sframe on an existing send stream reconfigures it in place.
+TEST_P(WebRtcVoiceEngineTestFake, EnableSframeReconfiguresExistingSendStream) {
+  ASSERT_TRUE(SetupSendStream());
+  ASSERT_FALSE(GetSendStreamConfig(kSsrcX).sframe_options.required);
+
+  send_channel_->EnableSframe();
+
+  EXPECT_TRUE(GetSendStreamConfig(kSsrcX).sframe_options.required);
+}
+
 // TODO(solenberg): Remove, once recv streams are configured through Call.
 //                  (This is then covered by TestSetRecvRtpHeaderExtensions.)
 TEST_P(WebRtcVoiceEngineTestFake, ConfiguresAudioReceiveStreamRtpExtensions) {
@@ -3364,9 +3390,15 @@ TEST_P(WebRtcVoiceEngineTestFake, ConfiguresAudioReceiveStreamRtpExtensions) {
   }
 
   // Set up receive extensions.
-  const std::vector<RtpExtension> header_extensions =
-      GetDefaultEnabledRtpHeaderExtensions(*engine_,
-                                           /* field_trials= */ nullptr);
+  const auto header_extensions_caps =
+      GetDefaultEnabledRtpHeaderCapabilities(*engine_,
+                                             /* field_trials= */ nullptr);
+  std::vector<RtpExtension> header_extensions;
+  for (const auto& cap : header_extensions_caps) {
+    header_extensions.emplace_back(
+        cap.uri, cap.preferred_id.value_or(RtpHeaderExtensionId::NotSet()),
+        cap.preferred_encrypt);
+  }
   AudioReceiverParameters recv_parameters;
   recv_parameters.extensions = header_extensions;
   receive_channel_->SetReceiverParameters(recv_parameters);
@@ -3389,12 +3421,12 @@ TEST_P(WebRtcVoiceEngineTestFake, ConfiguresAudioReceiveStreamRtpExtensions) {
 TEST_P(WebRtcVoiceEngineTestFake, DeliverAudioPacket_Call) {
   // Test that packets are forwarded to the Call when configured accordingly.
   const uint32_t kAudioSsrc = 1;
-  CopyOnWriteBuffer kPcmuPacket(kPcmuFrame, sizeof(kPcmuFrame));
+  CopyOnWriteBuffer kPcmuPacket(kPcmuFrame);
   static const uint8_t kRtcp[] = {
       0x80, 0xc9, 0x00, 0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
       0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
       0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
-  CopyOnWriteBuffer kRtcpPacket(kRtcp, sizeof(kRtcp));
+  CopyOnWriteBuffer kRtcpPacket(kRtcp);
 
   EXPECT_TRUE(SetupSendStream());
   VoiceMediaReceiveChannelInterface* media_channel = ReceiveImpl();
@@ -3560,17 +3592,6 @@ TEST_P(WebRtcVoiceEngineTestFake, PreservePlayoutWhenRecreateRecvStream) {
   EXPECT_TRUE(GetRecvStream(kSsrcX).started());
 }
 
-// Tests when GetSources is called with non-existing ssrc, it will return an
-// empty list of RtpSource without crashing.
-TEST_P(WebRtcVoiceEngineTestFake, GetSourcesWithNonExistingSsrc) {
-  // Setup an recv stream with `kSsrcX`.
-  SetupRecvStream();
-  WebRtcVoiceReceiveChannel* media_channel = ReceiveImpl();
-  // Call GetSources with `kSsrcY` which doesn't exist.
-  std::vector<RtpSource> sources = media_channel->GetSources(kSsrcY);
-  EXPECT_EQ(0u, sources.size());
-}
-
 // Tests that the library initializes and shuts down properly.
 TEST(WebRtcVoiceEngineTest, StartupShutdown) {
   test::RunLoop run_loop;
@@ -3593,8 +3614,9 @@ TEST(WebRtcVoiceEngineTest, StartupShutdown) {
                                  CryptoOptions());
     EXPECT_TRUE(send_channel);
     std::unique_ptr<VoiceMediaReceiveChannelInterface> receive_channel =
-        engine.CreateReceiveChannel(env, call.get(), MediaConfig(),
-                                    AudioOptions(), CryptoOptions());
+        engine.CreateReceiveChannel(
+            env, call.get(), MediaConfig(), AudioOptions(), CryptoOptions(),
+            nullptr, [](uint32_t, const RtpPacketInfos&, Timestamp) {});
     EXPECT_TRUE(receive_channel);
   }
 }
@@ -3621,8 +3643,9 @@ TEST(WebRtcVoiceEngineTest, StartupShutdownWithExternalADM) {
                                    AudioOptions(), CryptoOptions());
       EXPECT_TRUE(send_channel);
       std::unique_ptr<VoiceMediaReceiveChannelInterface> receive_channel =
-          engine.CreateReceiveChannel(env, call.get(), MediaConfig(),
-                                      AudioOptions(), CryptoOptions());
+          engine.CreateReceiveChannel(
+              env, call.get(), MediaConfig(), AudioOptions(), CryptoOptions(),
+              nullptr, [](uint32_t, const RtpPacketInfos&, Timestamp) {});
       EXPECT_TRUE(receive_channel);
     }
     // The engine/channel should have dropped their references.
@@ -3729,9 +3752,9 @@ TEST(WebRtcVoiceEngineTest, SetRecvCodecs) {
     AutoInitTerminate init_term(engine);
     std::unique_ptr<Call> call =
         Call::Create(CallConfig::CreateSingleThreaded(env));
-    WebRtcVoiceReceiveChannel channel(env, &engine, MediaConfig(),
-                                      AudioOptions(), CryptoOptions(),
-                                      call.get());
+    WebRtcVoiceReceiveChannel channel(
+        env, &engine, MediaConfig(), AudioOptions(), CryptoOptions(),
+        call.get(), nullptr, [](uint32_t, const RtpPacketInfos&, Timestamp) {});
     AudioReceiverParameters parameters;
     parameters.codecs = ReceiveCodecsWithId(engine);
     EXPECT_TRUE(channel.SetReceiverParameters(parameters));
@@ -3866,9 +3889,8 @@ TEST(WebRtcVoiceEngineTest, CollectRecvCodecs) {
 }
 
 TEST(WebRtcVoiceEngineTest, CollectRecvCodecsWithLatePtAssignment) {
-  FieldTrials field_trials =
-      CreateTestFieldTrials("WebRTC-PayloadTypesInTransport/Enabled/");
-  Environment env = CreateEnvironment(&field_trials);
+  Environment env = CreateTestEnvironment(
+      {.field_trials = "WebRTC-PayloadTypesInTransport/Enabled/"});
 
   for (bool use_null_apm : {false, true}) {
     std::vector<AudioCodecSpec> specs;

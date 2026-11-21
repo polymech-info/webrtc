@@ -15,19 +15,25 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
+#include "absl/base/no_destructor.h"
+#include "absl/strings/ascii.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "api/rtc_error.h"
 #include "p2p/base/p2p_constants.h"
+#include "rtc_base/byte_order.h"
 #include "rtc_base/checks.h"
 #include "rtc_base/crc32.h"
 #include "rtc_base/crypto_random.h"
 #include "rtc_base/ip_address.h"
+#include "rtc_base/message_digest.h"
 #include "rtc_base/net_helper.h"
 #include "rtc_base/network_constants.h"
 #include "rtc_base/socket_address.h"
+#include "rtc_base/ssl_fingerprint.h"
 #include "rtc_base/string_encode.h"
 #include "rtc_base/strings/string_builder.h"
 
@@ -43,9 +49,11 @@ constexpr char kAttributeCandidateGeneration[] = "generation";
 constexpr char kAttributeCandidateNetworkId[] = "network-id";
 constexpr char kAttributeCandidateNetworkCost[] = "network-cost";
 constexpr char kAttributeCandidatePwd[] = "pwd";
+constexpr char kAttributeFingerprint[] = "fingerprint";
 
 constexpr absl::string_view kSdpDelimiterColon = ":";
 constexpr char kSdpDelimiterColonChar = kSdpDelimiterColon[0];
+constexpr char kSdpDelimiterSemicolonChar = ';';
 constexpr char kSdpDelimiterSpaceChar = ' ';
 constexpr char kSdpDelimiterEqualChar = '=';
 constexpr char kNewLineChar = '\n';
@@ -96,7 +104,8 @@ std::string BuildCandidate(const Candidate& candidate, bool include_ufrag) {
   // Note that we allow the tcptype to be missing, for backwards
   // compatibility; the implementation treats this as a passive candidate.
   // TODO(bugs.webrtc.org/11466): Treat a missing tcptype as an error?
-  if (candidate.protocol() == TCP_PROTOCOL_NAME &&
+  if ((candidate.protocol() == TCP_PROTOCOL_NAME ||
+       candidate.protocol() == TLS_PROTOCOL_NAME) &&
       !candidate.tcptype().empty()) {
     os << kTcpCandidateType << " " << candidate.tcptype() << " ";
   }
@@ -112,6 +121,11 @@ std::string BuildCandidate(const Candidate& candidate, bool include_ufrag) {
   if (candidate.network_cost() > 0) {
     os << " " << kAttributeCandidateNetworkCost << " "
        << candidate.network_cost();
+  }
+  if (candidate.fingerprint().has_value()) {
+    os << " " << kAttributeFingerprint << " "
+       << candidate.fingerprint()->algorithm << kSdpDelimiterSemicolonChar
+       << candidate.fingerprint()->GetRfc4572Fingerprint();
   }
 
   return os.str();
@@ -196,6 +210,7 @@ RTCErrorOr<Candidate> ParseCandidate(absl::string_view message) {
       break;
     case PROTO_TCP:
     case PROTO_SSLTCP:
+    case PROTO_TLS:
       tcp_protocol = true;
       break;
     default:
@@ -268,6 +283,7 @@ RTCErrorOr<Candidate> ParseCandidate(absl::string_view message) {
   uint32_t generation = 0;
   uint16_t network_id = 0;
   uint16_t network_cost = 0;
+  std::optional<SSLFingerprint> fingerprint;
   for (size_t i = current_position; i + 1 < fields.size(); ++i) {
     // RFC 5245
     // *(SP extension-att-name SP extension-att-value)
@@ -293,18 +309,55 @@ RTCErrorOr<Candidate> ParseCandidate(absl::string_view message) {
             absl::StrCat("Invalid ", kAttributeCandidateNetworkCost));
       }
       network_cost = std::min(network_cost, kNetworkCostMax);
+    } else if (fields[i] == kAttributeFingerprint) {
+      absl::string_view fp_data = fields[++i];
+      // Fingerprint extension format: algorithm;digest
+      std::vector<absl::string_view> fp_fields =
+          split(fp_data, kSdpDelimiterSemicolonChar);
+      if (fp_fields.size() != 2) {
+        return RTCError(RTCErrorType::SYNTAX_ERROR,
+                        absl::StrCat("Invalid ", kAttributeFingerprint));
+      }
+
+      fingerprint = SSLFingerprint::CreateOptionalFromRfc4572(
+          absl::AsciiStrToLower(fp_fields[0]), fp_fields[1]);
+      if (!fingerprint.has_value()) {
+        return RTCError(RTCErrorType::SYNTAX_ERROR,
+                        "Failed to create fingerprint from the digest.");
+      }
     } else {
       // Skip the unknown extension.
       ++i;
     }
   }
 
+  if (*protocol == PROTO_TLS && !fingerprint.has_value()) {
+    return RTCError(RTCErrorType::SYNTAX_ERROR,
+                    absl::StrCat("Missing ", kAttributeFingerprint,
+                                 " extension for TLS candidate"));
+  }
+
   Candidate candidate(component_id, ProtoToString(*protocol), address, priority,
                       username, password, candidate_type, generation,
-                      foundation, network_id, network_cost);
+                      foundation, network_id, network_cost,
+                      std::move(fingerprint));
   candidate.set_related_address(related_address);
   candidate.set_tcptype(tcptype);
   return candidate;
+}
+
+// Returns the key used for computing candidate foundations. The key is randomly
+// generated once per process and, unlike the ICE tie-breaker, never leaves the
+// process.
+absl::string_view GetFoundationKey() {
+  static const absl::NoDestructor<std::string> key([] {
+    // Use a key of the same size as the output of SHA-256.
+    constexpr size_t kKeySize = 32;
+    std::string random_key;
+    RTC_CHECK(CreateRandomData(kKeySize, &random_key));
+    return random_key;
+  }());
+  return *key;
 }
 
 }  // namespace
@@ -353,17 +406,19 @@ Candidate::Candidate()
       network_cost_(0),
       network_slice_(NetworkSlice::NO_SLICE) {}
 
-Candidate::Candidate(int component,
-                     absl::string_view protocol,
-                     const SocketAddress& address,
-                     uint32_t priority,
-                     absl::string_view username,
-                     absl::string_view password,
-                     IceCandidateType type,
-                     uint32_t generation,
-                     absl::string_view foundation,
-                     uint16_t network_id /*= 0*/,
-                     uint16_t network_cost /*= 0*/)
+Candidate::Candidate(
+    int component,
+    absl::string_view protocol,
+    const SocketAddress& address,
+    uint32_t priority,
+    absl::string_view username,
+    absl::string_view password,
+    IceCandidateType type,
+    uint32_t generation,
+    absl::string_view foundation,
+    uint16_t network_id /*= 0*/,
+    uint16_t network_cost /*= 0*/,
+    std::optional<SSLFingerprint> fingerprint /*= std::nullopt*/)
     : id_(CreateRandomString(8)),
       component_(component),
       protocol_(protocol),
@@ -378,11 +433,8 @@ Candidate::Candidate(int component,
       foundation_(foundation),
       network_id_(network_id),
       network_cost_(network_cost),
-      network_slice_(NetworkSlice::NO_SLICE) {}
-
-Candidate::Candidate(const Candidate&) = default;
-
-Candidate::~Candidate() = default;
+      network_slice_(NetworkSlice::NO_SLICE),
+      fingerprint_(std::move(fingerprint)) {}
 
 void Candidate::generate_id() {
   id_ = CreateRandomString(8);
@@ -414,7 +466,7 @@ bool Candidate::IsEquivalent(const Candidate& c) const {
          (password_ == c.password_) && (type_ == c.type_) &&
          (generation_ == c.generation_) && (foundation_ == c.foundation_) &&
          (related_address_ == c.related_address_) &&
-         (network_id_ == c.network_id_);
+         (network_id_ == c.network_id_) && (fingerprint_ == c.fingerprint_);
 }
 
 bool Candidate::MatchesForRemoval(const Candidate& c) const {
@@ -424,6 +476,8 @@ bool Candidate::MatchesForRemoval(const Candidate& c) const {
 
 std::string Candidate::ToStringInternal(bool sensitive) const {
   StringBuilder ost;
+  // Fits the typical description without reallocations.
+  ost.Reserve(256);
   std::string address =
       sensitive ? address_.ToSensitiveString() : address_.ToString();
   std::string related_address = sensitive ? related_address_.ToSensitiveString()
@@ -491,7 +545,8 @@ bool Candidate::operator==(const Candidate& o) const {
          network_type_ == o.network_type_ && generation_ == o.generation_ &&
          foundation_ == o.foundation_ &&
          related_address_ == o.related_address_ && tcptype_ == o.tcptype_ &&
-         network_id_ == o.network_id_ && network_slice_ == o.network_slice_;
+         network_id_ == o.network_id_ && network_slice_ == o.network_slice_ &&
+         fingerprint_ == o.fingerprint_;
 }
 
 bool Candidate::operator!=(const Candidate& o) const {
@@ -556,7 +611,19 @@ void Candidate::ComputeFoundation(const SocketAddress& base_address,
   // - 1 (that is, a 64-bit positive integer).  This number is used in
   // connectivity checks to detect and repair this case [...]
   sb << absl::StrCat(tie_breaker);
-  foundation_ = absl::StrCat(ComputeCrc32(sb.Release()));
+
+  // Since the tie-breaker is sent in connectivity checks, it can't by itself
+  // prevent the base address, which may be hidden behind an mDNS name, from
+  // being recovered from the foundation by brute force. So the foundation is
+  // computed using a keyed cryptographic hash, with a key that is never sent.
+  const absl::string_view key = GetFoundationKey();
+  const std::string input = sb.Release();
+  uint8_t digest[MessageDigest::kMaxSize];
+  const size_t digest_size =
+      ComputeHmac(DIGEST_SHA_256, key.data(), key.size(), input.data(),
+                  input.size(), digest, sizeof(digest));
+  RTC_CHECK_GE(digest_size, sizeof(uint32_t));
+  foundation_ = absl::StrCat(GetBE32(digest));
 }
 
 void Candidate::ComputePrflxFoundation() {

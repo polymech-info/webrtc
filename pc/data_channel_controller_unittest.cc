@@ -17,11 +17,16 @@
 #include <utility>
 #include <vector>
 
+#include "absl/functional/any_invocable.h"
 #include "api/data_channel_event_observer_interface.h"
 #include "api/data_channel_interface.h"
+#include "api/jsep.h"
 #include "api/make_ref_counted.h"
+#include "api/media_stream_interface.h"
+#include "api/peer_connection_interface.h"
 #include "api/priority.h"
 #include "api/rtc_error.h"
+#include "api/rtp_receiver_interface.h"
 #include "api/scoped_refptr.h"
 #include "api/transport/data_channel_transport_interface.h"
 #include "api/units/timestamp.h"
@@ -134,7 +139,7 @@ class DataChannelControllerTest : public ::testing::Test {
     network_thread_.Stop();
   }
 
-  ScopedBaseFakeClock clock_;
+  ScopedFakeClock clock_;
   test::RunLoop run_loop_;
   Thread network_thread_;
   scoped_refptr<NiceMock<MockPeerConnectionInternal>> pc_;
@@ -298,6 +303,62 @@ TEST_F(DataChannelControllerTest, AllocateSctpSidsUafRepro) {
   pc_->network_thread()->BlockingCall([&] { dcc.OnTransportConnected(); });
 
   run_loop_.Flush();
+}
+
+// Closes `channel_to_close` from within the first `OnStateChange()` callback.
+// Callbacks are delivered directly on the network thread.
+class CloseOnStateChangeObserver : public DataChannelObserver {
+ public:
+  explicit CloseOnStateChangeObserver(DataChannelInterface* channel_to_close)
+      : channel_to_close_(channel_to_close) {}
+
+  void OnStateChange() override {
+    if (channel_to_close_ != nullptr) {
+      std::exchange(channel_to_close_, nullptr)->Close();
+    }
+  }
+  void OnMessage(const DataBuffer& /* buffer */) override {}
+  bool IsOkToCallOnTheNetworkThread() override { return true; }
+
+ private:
+  DataChannelInterface* channel_to_close_;
+};
+
+// Tests that AllocateSctpSids() doesn't start a channel that got closed (and
+// removed) while an earlier channel was being started. Here, the observer of
+// the first channel closes the second channel when the first channel opens.
+TEST_F(DataChannelControllerTest, AllocateSctpSidsSkipsChannelClosedByOther) {
+  NiceMock<MockDataChannelTransport> transport;
+  bool ready_to_send = false;
+  ON_CALL(transport, IsReadyToSend)
+      .WillByDefault(ReturnPointee(&ready_to_send));
+  // Don't assign stream ids when the channels are created.
+  ON_CALL(transport, DtlsRole).WillByDefault(Return(std::nullopt));
+  DataChannelControllerForTest dcc(pc_.get(), &transport);
+  // Complete the closing procedure of a channel synchronously.
+  ON_CALL(transport, CloseChannel).WillByDefault([&](int channel_id) {
+    dcc.OnChannelClosed(channel_id);
+    return RTCError::OK();
+  });
+
+  scoped_refptr<DataChannelInterface> ch1 =
+      dcc.InternalCreateDataChannelWithProxy(
+             "ch1", InternalDataChannelInit(DataChannelInit()))
+          .MoveValue();
+  scoped_refptr<DataChannelInterface> ch2 =
+      dcc.InternalCreateDataChannelWithProxy(
+             "ch2", InternalDataChannelInit(DataChannelInit()))
+          .MoveValue();
+  CloseOnStateChangeObserver observer(ch2.get());
+  ch1->RegisterObserver(&observer);
+
+  ready_to_send = true;
+  network_thread_.BlockingCall([&] { dcc.AllocateSctpSids(SSL_CLIENT); });
+  run_loop_.Flush();
+
+  EXPECT_EQ(ch1->state(), DataChannelInterface::kOpen);
+  EXPECT_EQ(ch2->state(), DataChannelInterface::kClosed);
+  ch1->UnregisterObserver();
 }
 
 TEST_F(DataChannelControllerTest, BufferedAmountIncludesFromTransport) {
@@ -618,6 +679,80 @@ TEST_F(DataChannelControllerTest, ObserverNotNotifiedOnUnknownId) {
   run_loop_.Flush();
 
   EXPECT_THAT(messages, IsEmpty());
+}
+
+TEST_F(DataChannelControllerTest, ReopenChannelWhileClosing) {
+  NiceMock<MockDataChannelTransport> transport;
+  DataChannelControllerForTest dcc(pc_.get(), &transport);
+
+  // 1. Create old channel with ID 4.
+  RTCErrorOr<scoped_refptr<DataChannelInterface>> ret =
+      dcc.InternalCreateDataChannelWithProxy(
+          "OldChannel", InternalDataChannelInit({.negotiated = true, .id = 4}));
+  ASSERT_TRUE(ret.ok());
+  auto old_channel = ret.MoveValue();
+
+  // 2. Close the old channel. It should transition to kClosing.
+  old_channel->Close();
+  run_loop_.Flush();
+  EXPECT_EQ(old_channel->state(), DataChannelInterface::DataState::kClosing);
+
+  // 3. Prepare to capture the new channel creation via observer.
+  scoped_refptr<DataChannelInterface> new_channel;
+  ON_CALL(*pc_, RunWithObserver)
+      .WillByDefault(
+          [&](absl::AnyInvocable<void(webrtc::PeerConnectionObserver*) &&>
+                  callback) {
+            class FakeObserver : public PeerConnectionObserver {
+             public:
+              explicit FakeObserver(
+                  scoped_refptr<DataChannelInterface>& out_channel)
+                  : out_channel_(out_channel) {}
+              void OnSignalingChange(
+                  PeerConnectionInterface::SignalingState) override {}
+              void OnAddTrack(
+                  scoped_refptr<RtpReceiverInterface>,
+                  const std::vector<scoped_refptr<MediaStreamInterface>>&)
+                  override {}
+              void OnDataChannel(
+                  scoped_refptr<DataChannelInterface> data_channel) override {
+                out_channel_ = data_channel;
+              }
+              void OnRenegotiationNeeded() override {}
+              void OnIceConnectionChange(
+                  PeerConnectionInterface::IceConnectionState) override {}
+              void OnIceGatheringChange(
+                  PeerConnectionInterface::IceGatheringState) override {}
+              void OnIceCandidate(const IceCandidate*) override {}
+
+             private:
+              scoped_refptr<DataChannelInterface>& out_channel_;
+            };
+            FakeObserver observer(new_channel);
+            std::move(callback)(&observer);
+          });
+
+  // 4. Construct a valid OPEN message for SID 4.
+  CopyOnWriteBuffer open_message;
+  DataChannelInit open_config;
+  open_config.id = 4;
+  ASSERT_TRUE(
+      WriteDataChannelOpenMessage("NewChannel", open_config, &open_message));
+
+  // 5. Deliver the OPEN message. This should trigger creation of the new
+  // channel.
+  network_thread_.BlockingCall([&]() {
+    dcc.OnDataReceived(4, DataMessageType::kControl, open_message);
+  });
+  run_loop_.Flush();
+
+  // 6. Verify that the new channel was created.
+  ASSERT_NE(new_channel, nullptr);
+  EXPECT_EQ(new_channel->label(), "NewChannel");
+  EXPECT_EQ(new_channel->id(), 4);
+
+  // Verify that the old channel is now in the kClosed state.
+  EXPECT_EQ(old_channel->state(), DataChannelInterface::DataState::kClosed);
 }
 
 }  // namespace

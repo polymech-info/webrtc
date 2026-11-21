@@ -20,17 +20,11 @@ USE_PYTHON3 = True
 
 # Files and directories that are *skipped* by cpplint in the presubmit script.
 CPPLINT_EXCEPTIONS = [
-    'api/video_codecs/video_decoder.h',
-    'common_types.cc',
-    'common_types.h',
     'examples/objc',
-    'media/base/stream_params.h',
-    'media/base/video_common.h',
     'modules/audio_coding',
     'modules/audio_device',
     'modules/audio_processing',
     'modules/desktop_capture',
-    'modules/include/module_common_types.h',
     'modules/utility',
     'modules/video_capture',
     'PRESUBMIT.py',
@@ -39,14 +33,14 @@ CPPLINT_EXCEPTIONS = [
     'rtc_base',
     'sdk/android/src/jni',
     'sdk/objc',
-    'system_wrappers',
     'test',
     'tools_webrtc',
-    'voice_engine',
 ]
 
 PYLINT_OLD_STYLE = [
     "PRESUBMIT.py",
+    "presubmit_test.py",
+    "presubmit_test_mocks.py",
     "tools_webrtc/autoroller/roll_deps.py",
     "tools_webrtc/android/build_aar.py",
     "tools_webrtc/ios/build_ios_libs.py",
@@ -1479,12 +1473,6 @@ def CheckAddedDepsHaveTargetApprovals(input_api, output_api):
         return []
 
     if input_api.is_committing:
-        if input_api.tbr:
-            return [
-                output_api.PresubmitNotifyResult(
-                    '--tbr was specified, skipping OWNERS check for DEPS '
-                    'additions')
-            ]
         if input_api.dry_run:
             return [
                 output_api.PresubmitNotifyResult(

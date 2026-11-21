@@ -19,6 +19,7 @@
 #include <span>
 #include <string>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "absl/functional/any_invocable.h"
@@ -49,6 +50,7 @@
 #include "audio/channel_send_frame_transformer_delegate.h"
 #include "audio/utility/audio_frame_operations.h"
 #include "call/rtp_transport_controller_send_interface.h"
+#include "call/sframe_options.h"
 #include "modules/audio_coding/include/audio_coding_module.h"
 #include "modules/audio_coding/include/audio_coding_module_typedefs.h"
 #include "modules/audio_processing/rms_level.h"
@@ -60,12 +62,12 @@
 #include "modules/rtp_rtcp/source/rtp_packet_to_send.h"
 #include "modules/rtp_rtcp/source/rtp_rtcp_impl2.h"
 #include "modules/rtp_rtcp/source/rtp_sender_audio.h"
+#include "modules/sframe/sframe_encryption_config.h"
 #include "rtc_base/buffer.h"
 #include "rtc_base/checks.h"
 #include "rtc_base/event.h"
 #include "rtc_base/logging.h"
 #include "rtc_base/race_checker.h"
-#include "rtc_base/rate_limiter.h"
 #include "rtc_base/strings/string_builder.h"
 #include "rtc_base/synchronization/mutex.h"
 #include "rtc_base/system/no_unique_address.h"
@@ -78,11 +80,7 @@ namespace voe {
 
 namespace {
 
-constexpr TimeDelta kMaxRetransmissionWindow = TimeDelta::Seconds(1);
-constexpr TimeDelta kMinRetransmissionWindow = TimeDelta::Millis(30);
-
 class RtpPacketSenderProxy;
-class TransportSequenceNumberProxy;
 
 class AudioBitrateAccountant {
  public:
@@ -139,6 +137,8 @@ class ChannelSend : public ChannelSendInterface,
               bool extmap_allow_mixed,
               int rtcp_report_interval_ms,
               uint32_t ssrc,
+              const std::optional<RtpState>& rtp_state,
+              absl::string_view mid,
               scoped_refptr<FrameTransformerInterface> frame_transformer,
               RtpTransportControllerSendInterface* transport_controller);
 
@@ -207,6 +207,8 @@ class ChannelSend : public ChannelSendInterface,
   void SetFrameEncryptor(
       scoped_refptr<FrameEncryptorInterface> frame_encryptor) override;
 
+  void SetSframeOptions(const SframeSendOptions& options) override;
+
   // Sets a frame transformer between encoder and packetizer, to transform
   // encoded frames before sending them out the network.
   void SetEncoderToPacketizerFrameTransformer(
@@ -233,12 +235,15 @@ class ChannelSend : public ChannelSendInterface,
 
  private:
   // From AudioPacketizationCallback in the ACM
-  int32_t SendData(AudioFrameType frameType,
-                   uint8_t payloadType,
-                   uint32_t rtp_timestamp,
-                   const uint8_t* payloadData,
-                   size_t payloadSize,
-                   int64_t absolute_capture_timestamp_ms) override;
+  int32_t SendData(
+      AudioFrameType frameType,
+      uint8_t payloadType,
+      uint32_t rtp_timestamp,
+      const uint8_t* payloadData,
+      size_t payloadSize,
+      int64_t absolute_capture_timestamp_ms,
+      std::optional<uint8_t> audio_level_dbov_override,
+      std::optional<std::vector<uint32_t>> csrcs_override) override;
 
   bool InputMute() const;
 
@@ -294,7 +299,6 @@ class ChannelSend : public ChannelSendInterface,
 
   PacketRouter* packet_router_ RTC_GUARDED_BY(worker_thread_) = nullptr;
   const std::unique_ptr<RtpPacketSenderProxy> rtp_packet_pacer_proxy_;
-  const std::unique_ptr<RateLimiter> retransmission_rate_limiter_;
 
   RTC_NO_UNIQUE_ADDRESS SequenceChecker construction_thread_;
 
@@ -307,6 +311,11 @@ class ChannelSend : public ChannelSendInterface,
       RTC_GUARDED_BY(worker_thread_);
   // E2EE Frame Encryption Options
   const CryptoOptions crypto_options_;
+
+  // Sframe end-to-end encryption settings for this stream.
+  bool sframe_required_by_negotiation_ RTC_GUARDED_BY(worker_thread_) = false;
+  std::optional<SframeEncryptionConfig> sframe_encryption_config_
+      RTC_GUARDED_BY(worker_thread_);
 
   // Delegates calls to a frame transformer to transform audio, and
   // receives callbacks with the transformed frames; delegates calls to
@@ -375,12 +384,15 @@ class RtpPacketSenderProxy : public RtpPacketSender {
   RtpPacketSender* rtp_packet_pacer_ RTC_GUARDED_BY(&mutex_);
 };
 
-int32_t ChannelSend::SendData(AudioFrameType frameType,
-                              uint8_t payloadType,
-                              uint32_t rtp_timestamp,
-                              const uint8_t* payloadData,
-                              size_t payloadSize,
-                              int64_t absolute_capture_timestamp_ms) {
+int32_t ChannelSend::SendData(
+    AudioFrameType frameType,
+    uint8_t payloadType,
+    uint32_t rtp_timestamp,
+    const uint8_t* payloadData,
+    size_t payloadSize,
+    int64_t absolute_capture_timestamp_ms,
+    std::optional<uint8_t> audio_level_dbov_override,
+    std::optional<std::vector<uint32_t>> csrcs_override) {
   RTC_DCHECK_RUN_ON(&encoder_queue_checker_);
 
   std::optional<uint8_t> audio_level_dbov;
@@ -388,6 +400,9 @@ int32_t ChannelSend::SendData(AudioFrameType frameType,
     // Take the averaged audio levels from rms_level_ and reset it before
     // invoking any async transformer.
     audio_level_dbov = rms_level_.Average();
+    if (audio_level_dbov_override.has_value()) {
+      audio_level_dbov = audio_level_dbov_override;
+    }
   }
 
   if (frame_transformer_delegate_) {
@@ -399,11 +414,12 @@ int32_t ChannelSend::SendData(AudioFrameType frameType,
     frame_transformer_delegate_->Transform(
         frameType, payloadType, rtp_timestamp + rtp_rtcp_->StartTimestamp(),
         payloadData, payloadSize, absolute_capture_timestamp_ms,
-        rtp_rtcp_->SSRC(), mime_type.str(), audio_level_dbov, csrcs_);
+        rtp_rtcp_->SSRC(), mime_type.str(), audio_level_dbov,
+        csrcs_override.has_value() ? *csrcs_override : csrcs_);
     return 0;
   }
   Buffer payload(payloadData, payloadSize);
-  std::vector<uint32_t> csrcs = csrcs_;
+  std::vector<uint32_t> csrcs = csrcs_override.value_or(csrcs_);
   worker_thread_->PostTask(SafeTask(
       task_safety_.flag(),
       [this, frameType, payloadType, rtp_timestamp,
@@ -431,6 +447,13 @@ int32_t ChannelSend::SendRtpAudio(AudioFrameType frameType,
   // TODO(minyue): see whether DTMF packets should be encrypted or not. In
   // current implementation, they are not.
   if (!payload.empty()) {
+    if (sframe_required_by_negotiation_) {
+      // TODO(bugs.webrtc.org/479862368): Wire up the Sframe encryptor
+      RTC_DLOG(LS_ERROR) << "Dropping audio frame: Sframe is required but no "
+                            "Sframe encryptor is set up for this stream.";
+      return -1;
+    }
+
     if (frame_encryptor_ != nullptr) {
       // TODO(benwright@webrtc.org) - Allocate enough to always encrypt inline.
       // Allocate a buffer to hold the maximum possible encrypted payload.
@@ -507,19 +530,19 @@ ChannelSend::ChannelSend(
     bool extmap_allow_mixed,
     int rtcp_report_interval_ms,
     uint32_t ssrc,
+    const std::optional<RtpState>& rtp_state,
+    absl::string_view mid,
     scoped_refptr<FrameTransformerInterface> frame_transformer,
     RtpTransportControllerSendInterface* transport_controller)
     : env_(env),
       worker_thread_(TaskQueueBase::Current()),
       ssrc_(ssrc),
       rtp_packet_pacer_proxy_(new RtpPacketSenderProxy()),
-      retransmission_rate_limiter_(
-          new RateLimiter(&env_.clock(), kMaxRetransmissionWindow.ms())),
       frame_encryptor_(frame_encryptor),
       crypto_options_(crypto_options),
       encoder_queue_(env_.task_queue_factory().CreateTaskQueue(
           "AudioEncoderQueue",
-          env_.field_trials().IsEnabled("WebRTC-MediaTaskQueuePriorities")
+          !env_.field_trials().IsDisabled("WebRTC-MediaTaskQueuePriorities")
               ? TaskQueueFactory::Priority::kAudio
               : TaskQueueFactory::Priority::kNormal)),
       encoder_queue_checker_(encoder_queue_.get()),
@@ -535,14 +558,12 @@ ChannelSend::ChannelSend(
 
   configuration.paced_sender = rtp_packet_pacer_proxy_.get();
   configuration.rtt_stats = rtcp_rtt_stats;
-  if (env_.field_trials().IsDisabled("WebRTC-DisableRtxRateLimiter")) {
-    configuration.retransmission_rate_limiter =
-        retransmission_rate_limiter_.get();
-  }
   configuration.extmap_allow_mixed = extmap_allow_mixed;
   configuration.rtcp_report_interval_ms = rtcp_report_interval_ms;
   configuration.rtcp_packet_type_counter_observer = this;
   configuration.local_media_ssrc = ssrc;
+  configuration.rtp_state = rtp_state;
+  configuration.mid = std::string(mid);
   configuration.rtcp_mode = RtcpMode::kCompound;
 
   rtp_rtcp_ = ModuleRtpRtcpImpl2::CreateSendModule(env_, configuration);
@@ -676,7 +697,6 @@ void ChannelSend::OnBitrateAllocation(BitrateAllocationUpdate update) {
   CallEncoderAsync([update](AudioEncoder* encoder) {
     encoder->OnReceivedUplinkAllocation(update);
   });
-  retransmission_rate_limiter_->SetMaxRate(update.target_bitrate.bps());
 }
 
 int ChannelSend::GetTargetBitrate() const {
@@ -701,10 +721,6 @@ void ChannelSend::ReceivedRTCPPacket(const uint8_t* data, size_t length) {
     // Waiting for valid RTT.
     return;
   }
-
-  retransmission_rate_limiter_->SetWindowSize(
-      std::clamp(*rtt, kMinRetransmissionWindow, kMaxRetransmissionWindow)
-          .ms());
 
   OnReceivedRtt(rtt->ms());
 }
@@ -954,6 +970,12 @@ void ChannelSend::SetFrameEncryptor(
   frame_encryptor_ = std::move(frame_encryptor);
 }
 
+void ChannelSend::SetSframeOptions(const SframeSendOptions& options) {
+  RTC_DCHECK_RUN_ON(worker_thread_);
+  sframe_required_by_negotiation_ = options.required;
+  sframe_encryption_config_ = options.encryption_config;
+}
+
 void ChannelSend::SetEncoderToPacketizerFrameTransformer(
     scoped_refptr<FrameTransformerInterface> frame_transformer) {
   RTC_DCHECK_RUN_ON(worker_thread_);
@@ -976,22 +998,34 @@ void ChannelSend::InitFrameTransformerDelegate(
     scoped_refptr<FrameTransformerInterface> frame_transformer) {
   RTC_DCHECK_RUN_ON(&encoder_queue_checker_);
   RTC_DCHECK(frame_transformer);
-  RTC_DCHECK(!frame_transformer_delegate_);
+  if (frame_transformer_delegate_) {
+    frame_transformer_delegate_->Reset();
+    frame_transformer_delegate_ = nullptr;
+  }
 
   // Pass a callback to ChannelSend::SendRtpAudio, to be called by the delegate
   // to send the transformed audio.
   ChannelSendFrameTransformerDelegate::SendFrameCallback send_audio_callback =
       [this](AudioFrameType frameType, uint8_t payloadType,
-             uint32_t rtp_timestamp_with_offset,
+             RtpTimestampInfo rtp_timestamp_info,
              std::span<const uint8_t> payload,
              int64_t absolute_capture_timestamp_ms,
              std::span<const uint32_t> csrcs,
              std::optional<uint8_t> audio_level_dbov) {
         RTC_DCHECK_RUN_ON(worker_thread_);
-        return SendRtpAudio(
-            frameType, payloadType,
-            rtp_timestamp_with_offset - rtp_rtcp_->StartTimestamp(), payload,
-            absolute_capture_timestamp_ms, csrcs, audio_level_dbov);
+        uint32_t timestamp_without_offset;
+        if (std::holds_alternative<RtpTimestampWithoutOffset>(
+                rtp_timestamp_info)) {
+          timestamp_without_offset =
+              std::get<RtpTimestampWithoutOffset>(rtp_timestamp_info);
+        } else {
+          timestamp_without_offset =
+              std::get<RtpTimestampWithOffset>(rtp_timestamp_info) -
+              rtp_rtcp_->StartTimestamp();
+        }
+        return SendRtpAudio(frameType, payloadType, timestamp_without_offset,
+                            payload, absolute_capture_timestamp_ms, csrcs,
+                            audio_level_dbov);
       };
   frame_transformer_delegate_ =
       make_ref_counted<ChannelSendFrameTransformerDelegate>(
@@ -1011,11 +1045,13 @@ std::unique_ptr<ChannelSendInterface> CreateChannelSend(
     bool extmap_allow_mixed,
     int rtcp_report_interval_ms,
     uint32_t ssrc,
+    const std::optional<RtpState>& rtp_state,
+    absl::string_view mid,
     scoped_refptr<FrameTransformerInterface> frame_transformer,
     RtpTransportControllerSendInterface* transport_controller) {
   return std::make_unique<ChannelSend>(
       env, rtp_transport, rtcp_rtt_stats, frame_encryptor, crypto_options,
-      extmap_allow_mixed, rtcp_report_interval_ms, ssrc,
+      extmap_allow_mixed, rtcp_report_interval_ms, ssrc, rtp_state, mid,
       std::move(frame_transformer), transport_controller);
 }
 

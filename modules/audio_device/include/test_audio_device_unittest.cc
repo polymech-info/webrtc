@@ -28,7 +28,6 @@
 #include "api/audio/audio_device.h"
 #include "api/audio/audio_device_defines.h"
 #include "api/environment/environment.h"
-#include "api/environment/environment_factory.h"
 #include "api/scoped_refptr.h"
 #include "api/units/time_delta.h"
 #include "api/units/timestamp.h"
@@ -37,6 +36,7 @@
 #include "rtc_base/checks.h"
 #include "rtc_base/synchronization/mutex.h"
 #include "rtc_base/thread_annotations.h"
+#include "test/create_test_environment.h"
 #include "test/gmock.h"
 #include "test/gtest.h"
 #include "test/testsupport/file_utils.h"
@@ -50,9 +50,9 @@ void RunWavTest(const std::vector<int16_t>& input_samples,
   const ::testing::TestInfo* const test_info =
       ::testing::UnitTest::GetInstance()->current_test_info();
 
-  const std::string output_filename = test::OutputPathWithRandomDirectory() +
-                                      "BoundedWavFileWriterTest_" +
-                                      test_info->name() + ".wav";
+  const std::string output_dir = test::OutputPathWithRandomDirectory();
+  const std::string output_filename =
+      output_dir + "BoundedWavFileWriterTest_" + test_info->name() + ".wav";
 
   static const size_t kSamplesPerFrame = 8;
   static const int kSampleRate = kSamplesPerFrame * 100;
@@ -81,7 +81,8 @@ void RunWavTest(const std::vector<int16_t>& input_samples,
     EXPECT_EQ(0u, reader.ReadSamples(read_samples.size(), read_samples.data()));
   }
 
-  remove(output_filename.c_str());
+  EXPECT_TRUE(test::RemoveFile(output_filename));
+  EXPECT_TRUE(test::RemoveDir(output_dir));
 }
 
 TEST(BoundedWavFileWriterTest, NoSilence) {
@@ -153,9 +154,9 @@ TEST(WavFileReaderTest, RepeatedTrueWithSingleFrameFileReadTwice) {
   static const BufferT<int16_t> kExpectedSamples(kInputSamples.data(),
                                                  kInputSamples.size());
 
-  const std::string output_filename = test::OutputPathWithRandomDirectory() +
-                                      "WavFileReaderTest_RepeatedTrue_" +
-                                      ".wav";
+  const std::string output_dir = test::OutputPathWithRandomDirectory();
+  const std::string output_filename =
+      output_dir + "WavFileReaderTest_RepeatedTrue_.wav";
 
   static const size_t kSamplesPerFrame = 8;
   static const int kSampleRate = kSamplesPerFrame * 100;
@@ -185,7 +186,8 @@ TEST(WavFileReaderTest, RepeatedTrueWithSingleFrameFileReadTwice) {
     EXPECT_EQ(kExpectedSamples, buffer);
   }
 
-  remove(output_filename.c_str());
+  EXPECT_TRUE(test::RemoveFile(output_filename));
+  EXPECT_TRUE(test::RemoveDir(output_dir));
 }
 
 void RunRawTestNoRepeat(const std::vector<int16_t>& input_samples,
@@ -193,9 +195,9 @@ void RunRawTestNoRepeat(const std::vector<int16_t>& input_samples,
   const ::testing::TestInfo* const test_info =
       ::testing::UnitTest::GetInstance()->current_test_info();
 
-  const std::string output_filename = test::OutputPathWithRandomDirectory() +
-                                      "RawFileTest_" + test_info->name() +
-                                      ".raw";
+  const std::string output_dir = test::OutputPathWithRandomDirectory();
+  const std::string output_filename =
+      output_dir + "RawFileTest_" + test_info->name() + ".raw";
 
   static const size_t kSamplesPerFrame = 8;
   static const int kSampleRate = kSamplesPerFrame * 100;
@@ -231,7 +233,8 @@ void RunRawTestNoRepeat(const std::vector<int16_t>& input_samples,
     EXPECT_TRUE(buffer.empty());
   }
 
-  remove(output_filename.c_str());
+  EXPECT_TRUE(test::RemoveFile(output_filename));
+  EXPECT_TRUE(test::RemoveDir(output_dir));
 }
 
 TEST(RawFileWriterTest, NoSilence) {
@@ -301,8 +304,9 @@ TEST(RawFileWriterTest, Repeat) {
   const ::testing::TestInfo* const test_info =
       ::testing::UnitTest::GetInstance()->current_test_info();
 
-  const std::string output_filename = test::OutputPathWithRandomDirectory() +
-                                      "RawFileTest_" + test_info->name() + "_" +
+  const std::string output_dir = test::OutputPathWithRandomDirectory();
+  const std::string output_filename = output_dir + "RawFileTest_" +
+                                      test_info->name() + "_" +
                                       std::to_string(std::rand()) + ".raw";
 
   static const size_t kSamplesPerFrame = 8;
@@ -336,7 +340,8 @@ TEST(RawFileWriterTest, Repeat) {
     EXPECT_EQ(kExpectedSamples, buffer);
   }
 
-  remove(output_filename.c_str());
+  EXPECT_TRUE(test::RemoveFile(output_filename));
+  EXPECT_TRUE(test::RemoveDir(output_dir));
 }
 
 TEST(PulsedNoiseCapturerTest, SetMaxAmplitude) {
@@ -484,8 +489,7 @@ class TestAudioTransport : public AudioTransport {
 
 TEST(TestAudioDeviceModuleTest, CreatedADMCanRecord) {
   GlobalSimulatedTimeController time_controller(kStartTime);
-  const Environment env = CreateEnvironment(
-      time_controller.GetClock(), time_controller.GetTaskQueueFactory());
+  const Environment env = CreateTestEnvironment({.time = &time_controller});
   TestAudioTransport audio_transport(TestAudioTransport::Mode::kRecording);
   std::unique_ptr<TestAudioDeviceModule::PulsedNoiseCapturer> capturer =
       TestAudioDeviceModule::CreatePulsedNoiseCapturer(
@@ -518,8 +522,7 @@ TEST(TestAudioDeviceModuleTest, CreatedADMCanRecord) {
 
 TEST(TestAudioDeviceModuleTest, CreatedADMCanPlay) {
   GlobalSimulatedTimeController time_controller(kStartTime);
-  const Environment env = CreateEnvironment(
-      time_controller.GetClock(), time_controller.GetTaskQueueFactory());
+  const Environment env = CreateTestEnvironment({.time = &time_controller});
   TestAudioTransport audio_transport(TestAudioTransport::Mode::kPlaying);
   std::unique_ptr<TestAudioDeviceModule::Renderer> renderer =
       TestAudioDeviceModule::CreateDiscardRenderer(

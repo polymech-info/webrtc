@@ -12,8 +12,13 @@
 #define RTC_BASE_OPENSSL_UTILITY_H_
 
 #include <openssl/ossl_typ.h>
+#ifdef OPENSSL_IS_BORINGSSL
+#include <openssl/pool.h>
+#endif
+#include <openssl/x509.h>
 
 #include <cstdint>
+#include <span>
 
 #include "absl/strings/string_view.h"
 
@@ -39,9 +44,31 @@ bool ParseCertificate(CRYPTO_BUFFER* cert_buffer,
 // are trying to avoid in favor of CRYPTO_BUFFERs (see crbug.com/webrtc/11410).
 bool VerifyPeerCertMatchesHost(SSL* ssl, absl::string_view host);
 
+// Returns true if the SubjectPublicKeyInfo of the DER-encoded certificate
+// `cert_der` is explicitly distrusted (e.g. because the private key of a CA was
+// compromised). Matching on the public key also covers cross-signed and
+// reissued certificates for the same key.
+//
+// Fails closed: also returns true if `cert_der` cannot be parsed. WebPKI
+// certificates must be DER-encoded, and a lenient custom verifier could
+// otherwise accept a BER re-encoding of a distrusted certificate whose outer
+// SEQUENCE (not covered by the issuer's signature) this parser rejects.
+bool IsDistrustedCertificate(std::span<const uint8_t> cert_der);
+
+// Returns true if any certificate in `chain` is distrusted according to
+// IsDistrustedCertificate().
+#ifdef OPENSSL_IS_BORINGSSL
+bool ContainsDistrustedCertificate(const STACK_OF(CRYPTO_BUFFER) * chain);
+#endif
+bool ContainsDistrustedCertificate(const STACK_OF(X509) * chain);
+
 // Logs all the errors in the OpenSSL errror queue from the current thread. A
 // prefix can be provided for context.
 void LogSSLErrors(absl::string_view prefix);
+
+// Logs a human-readable description of the SSL connection's handshake state
+// and any alerts. Intended to be installed via SSL_CTX_set_info_callback().
+void SSLInfoCallback(const SSL* ssl, int where, int ret);
 
 #ifndef WEBRTC_EXCLUDE_BUILT_IN_SSL_ROOT_CERTS
 // Attempt to add the certificates from the loader into the SSL_CTX. False is

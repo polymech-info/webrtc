@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <span>
 #include <vector>
 
 #include "api/environment/environment.h"
@@ -44,7 +45,6 @@
 #include "modules/video_coding/utility/framerate_controller_deprecated.h"
 #include "rtc_base/containers/flat_map.h"
 #include "rtc_base/experiments/encoder_info_settings.h"
-#include "rtc_base/experiments/psnr_experiment.h"
 #include "third_party/libvpx/source/libvpx/vpx/vp8cx.h"
 #include "third_party/libvpx/source/libvpx/vpx/vpx_codec.h"
 #include "third_party/libvpx/source/libvpx/vpx/vpx_encoder.h"
@@ -74,6 +74,10 @@ class LibvpxVp9Encoder : public VideoEncoder {
   int RegisterEncodeCompleteCallback(EncodedImageCallback* callback) override;
 
   void SetRates(const RateControlParameters& parameters) override;
+
+  void SetComplexity(
+      std::span<const VideoCodecComplexity> complexity_by_spatial_layer,
+      ComplexityControlMode complexity_control_mode) override;
 
   EncoderInfo GetEncoderInfo() const override;
 
@@ -252,8 +256,6 @@ class LibvpxVp9Encoder : public VideoEncoder {
   const LibvpxVp9EncoderInfoSettings encoder_info_override_;
 
   // Determine whether the frame should be sampled for PSNR.
-  // TODO(webrtc:388070060): Remove after rollout.
-  const PsnrExperiment psnr_experiment_;
   FrameSampler psnr_frame_sampler_;
 
   // TODO(webrtc:500517546): Remove once the feature is fully deployed.
